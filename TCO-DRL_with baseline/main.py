@@ -15,6 +15,7 @@ import sys
 import atexit
 import json
 import io
+from pathlib import Path
 from datetime import datetime
 
 import numpy as np
@@ -30,14 +31,16 @@ from utils import get_args
 # -----------------------------------------------------------------------------
 # Automatic run logging and run folder
 # -----------------------------------------------------------------------------
-# Each run creates one self-contained folder:
-#   ./output/YY_M_D_HH_MM_Epoch{N}_Req{M}_{Scenario}/
+# Each run creates one self-contained folder under the CURRENT WORKING DIRECTORY by default:
+#   <cwd>/output/YY_M_D_HH_MM_Epoch{N}_Req{M}_{Scenario}/
 # containing:
 #   - full console log .txt
 #   - final results .csv/.json
 #   - DQN / PPO / RA-DDQN weight checkpoints .npz
 #   - reward curve pdf
-os.makedirs("./output", exist_ok=True)
+# NOTE: do not create output folder here. We parse args first, then resolve
+# args.Output_Dir from Path.cwd() so results are saved in the repository folder
+# where the user runs `python main.py`, not in a downloaded replacement folder.
 
 
 class Tee:
@@ -78,17 +81,29 @@ RUN_ID = (
     f"{_run_now.hour:02d}_{_run_now.minute:02d}_"
     f"Epoch{args.Epoch}_Req{args.Request_Num}_{args.Scenario}"
 )
-RUN_DIR = os.path.join("./output", RUN_ID)
-os.makedirs(RUN_DIR, exist_ok=True)
-RUN_TXT_PATH = os.path.join(RUN_DIR, f"{RUN_ID}.txt")
-RUN_CSV_PATH = os.path.join(RUN_DIR, f"{RUN_ID}_final_results.csv")
-RUN_JSON_PATH = os.path.join(RUN_DIR, f"{RUN_ID}_final_results.json")
+# Resolve output directory from the command working directory.
+# This fixes cases where files were saved into a downloaded zip/replacement path.
+_output_arg = Path(getattr(args, "Output_Dir", "output"))
+if _output_arg.is_absolute():
+    OUTPUT_BASE = _output_arg
+else:
+    OUTPUT_BASE = Path.cwd() / _output_arg
+OUTPUT_BASE = OUTPUT_BASE.resolve()
+OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+RUN_DIR = (OUTPUT_BASE / RUN_ID).resolve()
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+RUN_TXT_PATH = str(RUN_DIR / f"{RUN_ID}.txt")
+RUN_CSV_PATH = str(RUN_DIR / f"{RUN_ID}_final_results.csv")
+RUN_JSON_PATH = str(RUN_DIR / f"{RUN_ID}_final_results.json")
 
 _log_f = open(RUN_TXT_PATH, "w", encoding="utf-8")
 sys.stdout = Tee(sys.__stdout__, _log_f)
 sys.stderr = Tee(sys.__stderr__, _log_f)
 atexit.register(_log_f.close)
 
+print(f"Current working directory: {Path.cwd().resolve()}")
+print(f"Output base directory: {OUTPUT_BASE}")
 print(f"Run folder: {RUN_DIR}")
 print(f"Run log path: {RUN_TXT_PATH}")
 # Replay argument/config prints into both terminal and log.
@@ -108,6 +123,17 @@ performance_cost = np.zeros(args.Baseline_num)
 performance_assigned_malicious_num = np.zeros(args.Baseline_num)
 performance_assigned_normal_num = np.zeros(args.Baseline_num)
 performance_assigned_trusted_num = np.zeros(args.Baseline_num)
+# PB-SafeDQN diagnostics. Non-PB methods will stay at zero.
+performance_primary_success = np.zeros(args.Baseline_num)
+performance_backup_used = np.zeros(args.Baseline_num)
+performance_backup_recovery = np.zeros(args.Baseline_num)
+performance_backup_skipped = np.zeros(args.Baseline_num)
+performance_conditional_backup_recovery = np.zeros(args.Baseline_num)
+performance_backup_score_mean = np.zeros(args.Baseline_num)
+performance_primary_malicious_num = np.zeros(args.Baseline_num)
+performance_backup_malicious_num = np.zeros(args.Baseline_num)
+performance_primary_trusted_num = np.zeros(args.Baseline_num)
+performance_backup_trusted_num = np.zeros(args.Baseline_num)
 
 # Generate environment.
 env = SchedulingEnv(args)
@@ -117,6 +143,7 @@ brainOthers = baselines(env.actionNum, env.oracleTypes)
 brainDQN = None
 brainPPO = None
 brainRA = None
+brainPB = None
 
 if "DQN" in args.Baselines:
     brainDQN = baseline_DQN(
@@ -155,6 +182,19 @@ if "RA-DDQN" in args.Baselines:
         seed=args.Seed,
     )
 
+if "PB-SafeDQN" in args.Baselines:
+    brainPB = DuelingDoubleDQN(
+        env.actionNum, env.s_features,
+        hidden_units=args.Dqn_hidden,
+        scope="PB_SafeDQN",
+        learning_rate=args.PB_lr,
+        memory_size=args.Dqn_memory_size,
+        batch_size=args.Dqn_batch_size,
+        e_greedy_increment=args.Dqn_epsilon_increment,
+        reward_clip=args.Reward_Clip,
+        seed=args.Seed + 1009,
+    )
+
 global_step = 0
 # Use one consistent evaluation window for per-episode and final summaries.
 # This excludes the warm-up/exploration prefix when Request_Num is small.
@@ -174,6 +214,7 @@ for episode in range(args.Epoch):
     has_last_dqn = False
     has_last_ppo = False
     has_last_ra = False
+    has_last_pb = False
 
     if brainDQN is not None:
         brainDQN.reward_list.clear()
@@ -181,6 +222,8 @@ for episode in range(args.Epoch):
         brainPPO.reward_list.clear()
     if brainRA is not None:
         brainRA.reward_list.clear()
+    if brainPB is not None:
+        brainPB.reward_list.clear()
 
     while True:
         # Update reputation every Time_Period_Size requests.
@@ -284,6 +327,22 @@ for episode in range(args.Epoch):
             last_ra_reward = reward_RA
             has_last_ra = True
 
+        # Optional PB-SafeDQN policy: Dueling Double DQN primary selector +
+        # reputation/load/cost-aware backup failover.
+        if brainPB is not None:
+            pb_state = env.getState(request_attrs, "PB-SafeDQN")
+            pb_mask = env.get_action_mask(request_attrs)
+            if has_last_pb:
+                brainPB.store_transition(last_pb_state, last_pb_action, last_pb_reward, pb_state, pb_mask)
+            action_PB = brainPB.choose_action(pb_state, pb_mask)
+            reward_PB = env.feedback_primary_backup(request_attrs, action_PB, "PB-SafeDQN")
+            if (global_step > args.PB_start_learn) and (global_step % args.PB_learn_interval == 0):
+                brainPB.learn()
+            last_pb_state = pb_state
+            last_pb_action = action_PB
+            last_pb_reward = reward_PB
+            has_last_pb = True
+
         if request_c % 500 == 0:
             # Keep these calls for compatibility with the original code, even if the values are not printed here.
             env.get_accumulateRewards(args.Baseline_num, performance_c, request_c)
@@ -320,8 +379,17 @@ for episode in range(args.Epoch):
             ' finishT:', total_Ts[i],
             'Cost:', total_cost[i],
         )
+    if "PB-SafeDQN" in args.Baselines:
+        print(
+            '[PB-SafeDQN diagnostics]',
+            'primary_success_rate:', env.get_totalPrimarySuccessRate(args.Baseline_num, startP)[args.Baselines.index("PB-SafeDQN")],
+            'backup_used_rate:', env.get_totalBackupUsedRate(args.Baseline_num, startP)[args.Baselines.index("PB-SafeDQN")],
+            'backup_recovery_rate:', env.get_totalBackupRecoveryRate(args.Baseline_num, startP)[args.Baselines.index("PB-SafeDQN")],
+            'conditional_backup_recovery_rate:', env.get_totalConditionalBackupRecoveryRate(args.Baseline_num, startP)[args.Baselines.index("PB-SafeDQN")],
+            'backup_skipped_rate:', env.get_totalBackupSkippedRate(args.Baseline_num, startP)[args.Baselines.index("PB-SafeDQN")],
+        )
 
-    if episode != 0:
+    if episode != 0 or args.Epoch == 1:
         performance_lamda += env.get_total_responseTs(args.Baseline_num, eval_start)
         performance_total_rewards += env.get_totalRewards(args.Baseline_num, eval_start)
         performance_success += env.get_totalSuccess(args.Baseline_num, eval_start)
@@ -332,6 +400,16 @@ for episode in range(args.Epoch):
         performance_assigned_malicious_num += env.get_totalMaliciousNum(args.Baseline_num, eval_start)
         performance_assigned_normal_num += env.get_totalNormalNum(args.Baseline_num, eval_start)
         performance_assigned_trusted_num += env.get_totalTrustedNum(args.Baseline_num, eval_start)
+        performance_primary_success += env.get_totalPrimarySuccessRate(args.Baseline_num, eval_start)
+        performance_backup_used += env.get_totalBackupUsedRate(args.Baseline_num, eval_start)
+        performance_backup_recovery += env.get_totalBackupRecoveryRate(args.Baseline_num, eval_start)
+        performance_backup_skipped += env.get_totalBackupSkippedRate(args.Baseline_num, eval_start)
+        performance_conditional_backup_recovery += env.get_totalConditionalBackupRecoveryRate(args.Baseline_num, eval_start)
+        performance_backup_score_mean += env.get_totalBackupScoreMean(args.Baseline_num, eval_start)
+        performance_primary_malicious_num += env.get_totalPrimaryMaliciousNum(args.Baseline_num, eval_start)
+        performance_backup_malicious_num += env.get_totalBackupMaliciousNum(args.Baseline_num, eval_start)
+        performance_primary_trusted_num += env.get_totalPrimaryTrustedNum(args.Baseline_num, eval_start)
+        performance_backup_trusted_num += env.get_totalBackupTrustedNum(args.Baseline_num, eval_start)
 
     if episode == 0 and brainDQN is not None and len(brainDQN.reward_list) > 0:
         sns.set_style("darkgrid")
@@ -360,6 +438,16 @@ performance_match = np.around(performance_match / divisor, 3)
 performance_assigned_malicious_num = np.around(performance_assigned_malicious_num / divisor, 0)
 performance_assigned_normal_num = np.around(performance_assigned_normal_num / divisor, 0)
 performance_assigned_trusted_num = np.around(performance_assigned_trusted_num / divisor, 0)
+performance_primary_success = np.around(performance_primary_success / divisor, 3)
+performance_backup_used = np.around(performance_backup_used / divisor, 3)
+performance_backup_recovery = np.around(performance_backup_recovery / divisor, 3)
+performance_backup_skipped = np.around(performance_backup_skipped / divisor, 3)
+performance_conditional_backup_recovery = np.around(performance_conditional_backup_recovery / divisor, 3)
+performance_backup_score_mean = np.around(performance_backup_score_mean / divisor, 3)
+performance_primary_malicious_num = np.around(performance_primary_malicious_num / divisor, 0)
+performance_backup_malicious_num = np.around(performance_backup_malicious_num / divisor, 0)
+performance_primary_trusted_num = np.around(performance_primary_trusted_num / divisor, 0)
+performance_backup_trusted_num = np.around(performance_backup_trusted_num / divisor, 0)
 
 print('method order:')
 print(args.Baselines)
@@ -383,6 +471,26 @@ print('requests assigned to normal oracle:')
 print(performance_assigned_normal_num)
 print('requests assigned to trusted oracle:')
 print(performance_assigned_trusted_num)
+print('primary_success_rate:')
+print(performance_primary_success)
+print('backup_used_rate:')
+print(performance_backup_used)
+print('backup_recovery_rate:')
+print(performance_backup_recovery)
+print('conditional_backup_recovery_rate:')
+print(performance_conditional_backup_recovery)
+print('backup_skipped_rate:')
+print(performance_backup_skipped)
+print('backup_score_mean:')
+print(performance_backup_score_mean)
+print('primary malicious oracle count:')
+print(performance_primary_malicious_num)
+print('backup malicious oracle count:')
+print(performance_backup_malicious_num)
+print('primary trusted oracle count:')
+print(performance_primary_trusted_num)
+print('backup trusted oracle count:')
+print(performance_backup_trusted_num)
 
 # Save machine-readable final results with the same timestamp prefix as the .txt log.
 final_results_df = pd.DataFrame({
@@ -397,6 +505,16 @@ final_results_df = pd.DataFrame({
     "assigned_malicious": performance_assigned_malicious_num,
     "assigned_normal": performance_assigned_normal_num,
     "assigned_trusted": performance_assigned_trusted_num,
+    "primary_success_rate": performance_primary_success,
+    "backup_used_rate": performance_backup_used,
+    "backup_recovery_rate": performance_backup_recovery,
+    "conditional_backup_recovery_rate": performance_conditional_backup_recovery,
+    "backup_skipped_rate": performance_backup_skipped,
+    "backup_score_mean": performance_backup_score_mean,
+    "primary_malicious": performance_primary_malicious_num,
+    "backup_malicious": performance_backup_malicious_num,
+    "primary_trusted": performance_primary_trusted_num,
+    "backup_trusted": performance_backup_trusted_num,
 })
 final_results_df.to_csv(RUN_CSV_PATH, index=False, encoding="utf-8-sig")
 
@@ -431,6 +549,11 @@ if brainRA is not None:
         os.path.join(RUN_DIR, f"{RUN_ID}_RA-DDQN_weights.npz"),
         metadata={**weight_metadata, "method": "RA-DDQN"},
     )
+if brainPB is not None:
+    weight_paths["PB-SafeDQN"] = brainPB.save_model(
+        os.path.join(RUN_DIR, f"{RUN_ID}_PB-SafeDQN_weights.npz"),
+        metadata={**weight_metadata, "method": "PB-SafeDQN", "backup_mode": args.PB_Backup_Mode, "backup_trigger": args.PB_Backup_Trigger, "min_backup_score": args.PB_Min_Backup_Score},
+    )
 
 print('saved model weights:')
 if len(weight_paths) == 0:
@@ -441,7 +564,8 @@ else:
 
 run_metadata = {
     "run_id": RUN_ID,
-    "run_dir": RUN_DIR,
+    "run_dir": str(RUN_DIR),
+    "output_base": str(OUTPUT_BASE),
     "log_txt": RUN_TXT_PATH,
     "final_results_csv": RUN_CSV_PATH,
     "weight_paths": weight_paths,
@@ -453,6 +577,8 @@ run_metadata = {
     "state_mode": args.State_Mode,
     "reward_mode": args.Reward_Mode,
     "action_mask_mode": args.Action_Mask_Mode,
+    "pb_backup_trigger": getattr(args, "PB_Backup_Trigger", None),
+    "pb_min_backup_score": float(getattr(args, "PB_Min_Backup_Score", 0.0)),
     "baselines": list(args.Baselines),
     "seed": int(args.Seed),
     "reward_scale": float(args.Reward_Scale),

@@ -14,6 +14,7 @@ def parameter_parser():
     parser.add_argument("--Baseline_num", type=int, default=0, help="Number of baselines. Set automatically.")
     parser.add_argument("--Epoch", type=int, default=10, help="Training episodes")
     parser.add_argument("--Seed", type=int, default=6, help="Random seed for Python/NumPy/TensorFlow")
+    parser.add_argument("--Output_Dir", type=str, default="output", help="Output directory. Relative paths are resolved from the current working directory, so results are saved in the repository folder you run from.")
 
     # DQN
     parser.add_argument("--Dqn_start_learn", type=int, default=300, help="Iteration to start DQN learning")
@@ -37,6 +38,42 @@ def parameter_parser():
     parser.add_argument("--Use_RA_DDQN", action="store_true", help="Append RA-DDQN as an additional experimental method")
     parser.add_argument("--RA_start_learn", type=int, default=300, help="Iteration to start RA-DDQN learning")
     parser.add_argument("--RA_learn_interval", type=int, default=1, help="RA-DDQN learning interval")
+
+    # Primary-Backup SafeDQN: primary is selected by a Dueling Double DQN,
+    # backup is selected by a lightweight reputation-load-cost safety rule.
+    parser.add_argument("--Use_PB_SafeDQN", action="store_true",
+                        help="Append PB-SafeDQN: primary-backup failover oracle selection")
+    parser.add_argument("--PB_lr", type=float, default=0.0022, help="Learning rate for PB-SafeDQN primary selector")
+    parser.add_argument("--PB_start_learn", type=int, default=200, help="Iteration to start PB-SafeDQN learning")
+    parser.add_argument("--PB_learn_interval", type=int, default=1, help="PB-SafeDQN learning interval")
+    parser.add_argument("--PB_Backup_Mode", choices=["parallel", "serial"], default="parallel",
+                        help="parallel: warm standby backup can recover without serial delay; serial: backup starts after primary failure")
+    parser.add_argument("--PB_Backup_Trigger", choices=["always", "cost_aware"], default="cost_aware",
+                        help="always: use backup after every primary failure; cost_aware: invoke backup only when expected recovery benefit exceeds cost/risk.")
+    parser.add_argument("--PB_Min_Backup_Score", type=float, default=0.38,
+                        help="Minimum observable backup utility required by cost-aware backup trigger.")
+    parser.add_argument("--PB_Backup_Recovery_Bonus", type=float, default=0.38,
+                        help="Extra bounded reward when backup recovers a failed primary")
+    parser.add_argument("--PB_Backup_Used_Penalty", type=float, default=0.16,
+                        help="Penalty for invoking backup to account for redundancy overhead")
+    parser.add_argument("--PB_Primary_Success_Bonus", type=float, default=0.18,
+                        help="Small bonus for primary success, reducing over-dependence on backup recovery")
+    parser.add_argument("--PB_Backup_Skip_Penalty", type=float, default=0.04,
+                        help="Small penalty when primary fails and cost-aware trigger skips backup")
+    parser.add_argument("--PB_Backup_Cost_Limit", type=float, default=1.05,
+                        help="Backup candidates above this cost are discouraged but not strictly forbidden")
+    parser.add_argument("--PB_W_RECENT_SUCCESS", type=float, default=0.42)
+    parser.add_argument("--PB_W_REPUTATION", type=float, default=0.24)
+    parser.add_argument("--PB_W_LOAD", type=float, default=0.18)
+    parser.add_argument("--PB_W_COST", type=float, default=0.10)
+    parser.add_argument("--PB_W_TOKEN", type=float, default=0.14,
+                        help="Backup selector weight for stake/token prior; observable and useful for cold start")
+    parser.add_argument("--PB_W_BEHAVIOR_RISK", type=float, default=0.20,
+                        help="Backup selector penalty for observed abnormal behavior risk")
+    parser.add_argument("--PB_W_DELAY", type=float, default=0.10,
+                        help="Backup selector penalty for estimated wait/execution delay")
+    parser.add_argument("--PB_Prior_Strength", type=float, default=2.0,
+                        help="Cold-start prior strength for backup recent-success estimate")
 
     # Oracle Settings. These defaults are overwritten by the scalable generator below.
     parser.add_argument("--Oracle_Type", type=list, default=[0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2], help="Oracle Type")
@@ -154,6 +191,8 @@ def parameter_parser():
 
     if args.Use_RA_DDQN and "RA-DDQN" not in args.Baselines:
         args.Baselines.append("RA-DDQN")
+    if args.Use_PB_SafeDQN and "PB-SafeDQN" not in args.Baselines:
+        args.Baselines.append("PB-SafeDQN")
 
     # Auto-generate scalable oracle community.
     # Role pattern matches the original 15-node setup: each service type has malicious, trusted, normal, trusted, trusted.

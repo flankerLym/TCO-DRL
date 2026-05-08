@@ -83,6 +83,16 @@ class SchedulingEnv:
             self.oracle_reputation_history[name] = np.zeros((self.timeperiodNum, self.oracleNum))
             self.reputation_timewindow[name] = np.zeros((0, self.oracleNum))
 
+        # Primary-backup diagnostic records. Rows:
+        # 0 primary_success, 1 backup_used, 2 backup_success, 3 backup_recovery,
+        # 4 primary_action, 5 backup_action, 6 primary_malicious, 7 backup_malicious,
+        # 8 primary_trusted, 9 backup_trusted, 10 backup_skipped_by_trigger,
+        # 11 selected_backup_score. Values remain zero for non-PB policies.
+        self.pb_records = {name: np.zeros((12, self.requestNum)) for name in self.policy_names}
+        for name in self.policy_names:
+            self.pb_records[name][4, :] = -1
+            self.pb_records[name][5, :] = -1
+
     def gen_workload(self, lamda):
         intervalT = stats.expon.rvs(scale=1 / lamda * 60, size=self.requestNum)
         print("intervalT mean: ", round(np.mean(intervalT), 3),
@@ -269,6 +279,266 @@ class SchedulingEnv:
         if not np.any(mask):
             mask[:] = True
         return mask.astype(bool)
+
+    def _simulate_oracle_attempt(self, request_attrs, action, policy_name, arrival_override=None):
+        """Simulate one oracle attempt without writing request-level metrics.
+
+        This helper is used by PB-SafeDQN, where a request may involve a primary
+        and a backup oracle. It returns the attempt-level timing, validation,
+        behavior and role information. The caller decides whether the request is
+        finally successful and then writes the combined result into self.events.
+        """
+        request_id, arrival_time, length, request_type, ddl = request_attrs
+        request_type = int(request_type)
+        action = int(action)
+        effective_arrival = float(arrival_time if arrival_override is None else arrival_override)
+
+        acc = self.oracleAcc[action]
+        cost = self.oracleCost[action]
+        oracle_type = int(self.oracleTypes[action])
+        validation_prob = self._effective_validation_prob(action, policy_name)
+        behavior_probs = self.oracleBehaviorProbs[action]
+
+        idleT = self.oracle_events[policy_name][0, action]
+        reputation = self.oracle_events[policy_name][2, action]
+        exeT = length / acc
+        waitT = max(idleT - effective_arrival, 0.0)
+        startT = effective_arrival + waitT
+        exe_time = (length * 1.05) / acc if action in self.malicious_oracles else exeT
+        if np.random.rand() < self.noise_probability:
+            real_exeT = exe_time + self.noise_delay
+        else:
+            real_exeT = exe_time
+        durationT = waitT + real_exeT
+        leaveT = startT + real_exeT
+        match = 1 if request_type == oracle_type else 0
+        validation_raw = 1 if np.random.rand() < validation_prob else 0
+        behavior_record = np.random.choice([0, 1, 5, 100], p=behavior_probs)
+        return {
+            "action": action,
+            "startT": startT,
+            "waitT": waitT,
+            "exeT": exeT,
+            "durationT": durationT,
+            "leaveT": leaveT,
+            "cost": cost,
+            "reputation": reputation,
+            "match": match,
+            "validation_raw": validation_raw,
+            "behavior_record": behavior_record,
+            "oracle_type": oracle_type,
+            "is_malicious": 1 if action in self.malicious_oracles else 0,
+            "is_trusted": 1 if action in self.trusted_oracles else 0,
+        }
+
+    def _backup_score_vector(self, request_attrs, primary_action, policy_name):
+        """Observable backup utility for PB-SafeDQN.
+
+        This score deliberately avoids privileged true validation probability.
+        It combines historical validation success, reputation, stake tokens,
+        recent load, observed abnormal behavior, cost and estimated delay.
+        Higher score means the backup is more likely to recover a failed primary
+        at acceptable cost and latency.
+        """
+        arrival_time = float(request_attrs[1])
+        length = float(request_attrs[2])
+        ddl = max(float(request_attrs[4]), 1e-8)
+
+        req_num = self.reputation_factors[policy_name][0]
+        val_num = self.reputation_factors[policy_name][1]
+        behavior_sum = self.reputation_factors[policy_name][3]
+
+        reputations = self.oracle_events[policy_name][2]
+        rep_norm = 0.5 * (np.tanh(reputations) + 1.0)
+        token_norm = np.clip(self.oracleToken / max(float(np.max(self.oracleToken)), 1e-8), 0.0, 1.0)
+
+        # Bayesian-style cold-start smoothing: before many observations, use a
+        # weak prior from reputation and stake, not true validation probability.
+        prior = 0.5 * rep_norm + 0.5 * token_norm
+        alpha = float(getattr(self.args, "PB_Prior_Strength", 2.0))
+        recent_success = (val_num + alpha * prior) / np.maximum(req_num + alpha, 1e-8)
+
+        recent_load = req_num / max(self.timeperiodSize, 1)
+        cost_norm = np.clip(self.oracleCost / max(float(np.max(self.oracleCost)), 1e-8), 0.0, 1.0)
+
+        avg_behavior = behavior_sum / np.maximum(req_num, 1.0)
+        behavior_risk = np.log1p(np.maximum(avg_behavior, 0.0)) / np.log1p(100.0)
+        behavior_risk = np.clip(behavior_risk, 0.0, 1.0)
+
+        estimated_wait = np.maximum(self.oracle_events[policy_name][0] - arrival_time, 0.0)
+        estimated_exe = length / np.maximum(self.oracleAcc, 1e-8)
+        delay_penalty = np.clip((estimated_wait + estimated_exe) / ddl, 0.0, 2.0) / 2.0
+
+        score = (
+            self.args.PB_W_RECENT_SUCCESS * recent_success
+            + self.args.PB_W_REPUTATION * rep_norm
+            + self.args.PB_W_TOKEN * token_norm
+            - self.args.PB_W_LOAD * recent_load
+            - self.args.PB_W_COST * cost_norm
+            - self.args.PB_W_BEHAVIOR_RISK * behavior_risk
+            - self.args.PB_W_DELAY * delay_penalty
+        )
+        # Discourage very expensive backup nodes unless their observed quality is clearly better.
+        score = score - 0.08 * (self.oracleCost > self.args.PB_Backup_Cost_Limit)
+        score = np.nan_to_num(score, nan=-1e9, posinf=1e9, neginf=-1e9)
+        return score
+
+    def choose_backup_oracle(self, request_attrs, primary_action, policy_name):
+        """Choose the best same-type backup oracle using observable safety score."""
+        mask = self.get_action_mask(request_attrs).astype(bool)
+        candidates = np.where(mask)[0]
+        candidates = np.array([c for c in candidates if int(c) != int(primary_action)], dtype=int)
+        if candidates.size == 0:
+            candidates = np.array([c for c in range(self.oracleNum) if int(c) != int(primary_action)], dtype=int)
+        if candidates.size == 0:
+            return int(primary_action)
+        score = self._backup_score_vector(request_attrs, primary_action, policy_name)
+        return int(candidates[np.argmax(score[candidates])])
+
+    def _should_use_backup(self, request_attrs, primary, backup_action, backup_score, policy_name):
+        """Cost-aware backup trigger.
+
+        The previous PB-SafeDQN used a backup after every primary failure, which
+        maximized success but inflated cost and response time. This trigger keeps
+        the recovery mechanism, but skips backups whose expected observable utility
+        is too low or, in serial mode, cannot plausibly meet the remaining deadline.
+        """
+        if getattr(self.args, "PB_Backup_Trigger", "cost_aware") == "always":
+            return True
+
+        if int(backup_action) == int(primary["action"]):
+            return False
+
+        # Serial backup cannot help when primary already consumes almost all deadline.
+        if getattr(self.args, "PB_Backup_Mode", "parallel") == "serial":
+            ddl = float(request_attrs[4])
+            length = float(request_attrs[2])
+            estimated_exe = length / max(float(self.oracleAcc[backup_action]), 1e-8)
+            remaining = ddl - float(primary["durationT"])
+            if remaining <= 0 or estimated_exe > remaining:
+                return False
+
+        return float(backup_score) >= float(getattr(self.args, "PB_Min_Backup_Score", 0.38))
+
+    def feedback_primary_backup(self, request_attrs, primary_action, policy_name="PB-SafeDQN"):
+        """Primary-backup failover feedback for PB-SafeDQN.
+
+        A Dueling Double DQN selects the primary oracle. If the primary attempt
+        fails validation-aware success, a backup oracle is selected by an
+        observable reputation-load-cost safety rule. In parallel mode, the
+        backup represents a warm-standby oracle whose response can recover the
+        request without serially doubling the latency. In serial mode, the
+        backup starts after the primary attempt. The final event records the
+        combined request outcome and cost.
+        """
+        if policy_name not in self.policy_names:
+            raise ValueError(f"Unknown policy_name: {policy_name}")
+        request_id, arrival_time, length, request_type, ddl = request_attrs
+        request_id = int(request_id)
+        ddl = float(ddl)
+
+        primary = self._simulate_oracle_attempt(request_attrs, primary_action, policy_name)
+        primary_success = 1 if (primary["durationT"] <= ddl and primary["match"] == 1 and primary["validation_raw"] == 1) else 0
+
+        backup_used = 0
+        backup_success = 0
+        backup_recovery = 0
+        backup_skipped = 0
+        backup = None
+        backup_action = -1
+        backup_score = 0.0
+        final_duration = primary["durationT"]
+        final_leaveT = primary["leaveT"]
+        total_cost = primary["cost"]
+        final_success = primary_success
+        combined_behavior = primary["behavior_record"]
+        combined_rep = primary["reputation"]
+
+        if primary_success == 0:
+            backup_action = self.choose_backup_oracle(request_attrs, primary["action"], policy_name)
+            backup_scores = self._backup_score_vector(request_attrs, primary["action"], policy_name)
+            backup_score = float(backup_scores[int(backup_action)])
+            if self._should_use_backup(request_attrs, primary, backup_action, backup_score, policy_name):
+                backup_used = 1
+                if getattr(self.args, "PB_Backup_Mode", "parallel") == "serial":
+                    backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=primary["leaveT"])
+                    final_duration = primary["durationT"] + backup["durationT"]
+                    final_leaveT = backup["leaveT"]
+                else:
+                    backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=arrival_time)
+                    final_duration = max(primary["durationT"], backup["durationT"])
+                    final_leaveT = float(arrival_time) + final_duration
+                total_cost += backup["cost"]
+                combined_behavior = max(float(primary["behavior_record"]), float(backup["behavior_record"]))
+                combined_rep = 0.5 * (float(primary["reputation"]) + float(backup["reputation"]))
+                backup_success = 1 if (final_duration <= ddl and backup["match"] == 1 and backup["validation_raw"] == 1) else 0
+                backup_recovery = 1 if backup_success == 1 else 0
+                final_success = 1 if backup_success == 1 else 0
+            else:
+                backup_skipped = 1
+
+        # The final request is type-matched if the successful route was matched;
+        # with type action masking this should be true, but keep it explicit.
+        final_match = primary["match"] if primary_success else (backup["match"] if backup is not None else primary["match"])
+        reward = self._risk_aware_reward(
+            combined_rep,
+            final_match,
+            final_success,
+            total_cost,
+            final_duration,
+            ddl,
+            combined_behavior,
+        )
+        reward += self.args.PB_Primary_Success_Bonus * primary_success
+        reward += self.args.PB_Backup_Recovery_Bonus * backup_recovery
+        reward -= self.args.PB_Backup_Used_Penalty * backup_used
+        reward -= self.args.PB_Backup_Skip_Penalty * backup_skipped
+        reward = float(np.clip(reward, -self.args.Reward_Clip, self.args.Reward_Clip))
+
+        # Write final combined request event.
+        ev = self.events[policy_name]
+        ev[0, request_id] = primary["action"]
+        ev[1, request_id] = primary["startT"]
+        ev[2, request_id] = primary["waitT"]
+        ev[3, request_id] = final_duration
+        ev[4, request_id] = final_leaveT
+        ev[5, request_id] = reward
+        ev[6, request_id] = primary["exeT"]
+        ev[7, request_id] = final_success
+        ev[8, request_id] = total_cost
+        ev[9, request_id] = 1 if final_duration <= ddl else 0
+
+        # Update primary oracle records.
+        for attempt in [primary, backup] if backup is not None else [primary]:
+            action = int(attempt["action"])
+            oe = self.oracle_events[policy_name]
+            oe[1, action] += 1
+            oe[0, action] = max(oe[0, action], attempt["leaveT"])
+            oe[3, action] += attempt["match"]
+            # Count raw validation successes for reputation, not final request success.
+            oe[4, action] += attempt["validation_raw"]
+
+            rf = self.reputation_factors[policy_name]
+            rf[0, action] += 1
+            rf[1, action] += attempt["validation_raw"]
+            rf[2, action] += attempt["durationT"]
+            rf[3, action] += attempt["behavior_record"]
+
+        pb = self.pb_records[policy_name]
+        pb[0, request_id] = primary_success
+        pb[1, request_id] = backup_used
+        pb[2, request_id] = backup_success
+        pb[3, request_id] = backup_recovery
+        pb[4, request_id] = primary["action"]
+        pb[5, request_id] = backup_action
+        pb[6, request_id] = primary["is_malicious"]
+        pb[7, request_id] = backup["is_malicious"] if backup is not None else 0
+        pb[8, request_id] = primary["is_trusted"]
+        pb[9, request_id] = backup["is_trusted"] if backup is not None else 0
+        pb[10, request_id] = backup_skipped
+        pb[11, request_id] = backup_score
+
+        return reward
 
     def feedback(self, request_attrs, action, policy_name):
         if policy_name not in self.policy_names:
@@ -543,6 +813,55 @@ class SchedulingEnv:
     def get_totalTrustedNum(self, policies, start=0):
         idx = self.trusted_oracles
         return np.around(self._metric_array(lambda n: self._assigned_count_from_events(n, idx, start)), 1)
+
+    def _pb_rate(self, row, start=0):
+        start = min(max(int(start), 0), self.requestNum - 1)
+        denom = max(self.requestNum - start, 1)
+        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][row, start:self.requestNum]) / denom), 3)
+
+    def _pb_count(self, row, start=0):
+        start = min(max(int(start), 0), self.requestNum - 1)
+        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][row, start:self.requestNum])), 1)
+
+    def get_totalPrimarySuccessRate(self, policies, start=0):
+        return self._pb_rate(0, start)
+
+    def get_totalBackupUsedRate(self, policies, start=0):
+        return self._pb_rate(1, start)
+
+    def get_totalBackupRecoveryRate(self, policies, start=0):
+        return self._pb_rate(3, start)
+
+    def get_totalBackupSkippedRate(self, policies, start=0):
+        return self._pb_rate(10, start)
+
+    def get_totalConditionalBackupRecoveryRate(self, policies, start=0):
+        start = min(max(int(start), 0), self.requestNum - 1)
+        def _cond(policy_name):
+            used = np.sum(self.pb_records[policy_name][1, start:self.requestNum])
+            rec = np.sum(self.pb_records[policy_name][3, start:self.requestNum])
+            return float(rec / max(used, 1.0))
+        return np.around(self._metric_array(_cond), 3)
+
+    def get_totalBackupScoreMean(self, policies, start=0):
+        start = min(max(int(start), 0), self.requestNum - 1)
+        def _score(policy_name):
+            scores = self.pb_records[policy_name][11, start:self.requestNum]
+            mask = scores != 0
+            return float(np.mean(scores[mask])) if np.any(mask) else 0.0
+        return np.around(self._metric_array(_score), 3)
+
+    def get_totalPrimaryMaliciousNum(self, policies, start=0):
+        return self._pb_count(6, start)
+
+    def get_totalBackupMaliciousNum(self, policies, start=0):
+        return self._pb_count(7, start)
+
+    def get_totalPrimaryTrustedNum(self, policies, start=0):
+        return self._pb_count(8, start)
+
+    def get_totalBackupTrustedNum(self, policies, start=0):
+        return self._pb_count(9, start)
 
     def get_totalMatchRate(self, policies, start=0):
         start = min(max(int(start), 0), self.requestNum - 1)
