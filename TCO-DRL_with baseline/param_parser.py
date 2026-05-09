@@ -1,14 +1,150 @@
 import argparse
 
 
+BASE_METHODS = ["Random", "Round-Robin", "Earliest", "DQN", "BLOR", "SemiGreedy", "PPO"]
+OPTIONAL_METHODS = ["RA-DDQN", "PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle"]
+ALL_METHODS = BASE_METHODS + OPTIONAL_METHODS
+
+METHOD_ALIASES = {
+    "random": "Random", "rr": "Round-Robin", "round-robin": "Round-Robin", "round_robin": "Round-Robin",
+    "earliest": "Earliest", "early": "Earliest",
+    "dqn": "DQN", "tco-drl": "DQN", "tco_drl": "DQN",
+    "blor": "BLOR", "semigreedy": "SemiGreedy", "semi-greedy": "SemiGreedy", "semi_greedy": "SemiGreedy",
+    "ppo": "PPO", "ra": "RA-DDQN", "ra-ddqn": "RA-DDQN", "ra_ddqn": "RA-DDQN",
+    "pb": "PB-SafeDQN", "pb-safe": "PB-SafeDQN", "pb-safedqn": "PB-SafeDQN", "pb_safedqn": "PB-SafeDQN",
+    "cobra": "COBRA-Oracle", "cobra-oracle": "COBRA-Oracle", "cobra_oracle": "COBRA-Oracle",
+    "hcrl": "HCRL-Oracle", "hcrl-oracle": "HCRL-Oracle", "hcrl_oracle": "HCRL-Oracle",
+}
+
+METHOD_PRESETS = {
+    "base": BASE_METHODS,
+    "default": BASE_METHODS,
+    "all": ALL_METHODS,
+    "paper_all": ALL_METHODS,
+    "rl_only": ["DQN", "PPO", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle"],
+    "fast": ["DQN", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle"],
+    "cobra": ["DQN", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle"],
+    "hcrl": ["DQN", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle"],
+    "hcrl_only": ["HCRL-Oracle"],
+    "pb_only": ["PB-SafeDQN"],
+    "cobra_only": ["COBRA-Oracle"],
+    "ra_only": ["RA-DDQN"],
+    "dqn_only": ["DQN"],
+}
+
+
+def _dedupe(seq):
+    out = []
+    for item in seq:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _canonical_method(name):
+    key = str(name).strip()
+    if key in ALL_METHODS:
+        return key
+    alias_key = key.lower().replace(" ", "")
+    if alias_key in METHOD_ALIASES:
+        return METHOD_ALIASES[alias_key]
+    alias_key = key.lower()
+    if alias_key in METHOD_ALIASES:
+        return METHOD_ALIASES[alias_key]
+    valid = ", ".join(ALL_METHODS + sorted(METHOD_ALIASES.keys()))
+    raise ValueError(f"Unknown method '{name}'. Valid methods/aliases: {valid}")
+
+
+def _resolve_selected_methods(args):
+    """Resolve the final method list.
+
+    Priority:
+      1. --Methods / --Run_Methods: exact user-selected methods.
+      2. --Method_Preset: preset method group.
+      3. --Baselines: legacy method list plus --Use_* append flags.
+      4. no selection: original base baselines plus optional --Use_* append flags.
+
+    With --Methods, the list is exact. We do not silently add every default
+    baseline, which prevents long runs when the user only wants one or two models.
+    """
+    exact_methods = getattr(args, "Methods", None)
+    if exact_methods:
+        methods = [_canonical_method(m) for m in exact_methods]
+        selection_mode = "exact"
+    elif getattr(args, "Method_Preset", None):
+        preset = args.Method_Preset
+        methods = list(METHOD_PRESETS[preset])
+        selection_mode = f"preset:{preset}"
+    else:
+        methods = list(args.Baselines if args.Baselines is not None else BASE_METHODS)
+        methods = [_canonical_method(m) for m in methods]
+        selection_mode = "legacy"
+
+        if args.Use_RA_DDQN and "RA-DDQN" not in methods:
+            methods.append("RA-DDQN")
+        if args.Use_PB_SafeDQN and "PB-SafeDQN" not in methods:
+            methods.append("PB-SafeDQN")
+        if args.Use_COBRA and "COBRA-Oracle" not in methods:
+            methods.append("COBRA-Oracle")
+        if args.Use_HCRL and "HCRL-Oracle" not in methods:
+            methods.append("HCRL-Oracle")
+
+    methods = _dedupe(methods)
+    if len(methods) == 0:
+        raise ValueError("No methods selected. Use --Methods DQN or --Method_Preset base/all/hcrl, etc.")
+
+    args.Baselines = methods
+    args.Baseline_num = len(methods)
+    args.Method_Selection_Mode = selection_mode
+
+    args.Use_RA_DDQN = "RA-DDQN" in methods
+    args.Use_PB_SafeDQN = "PB-SafeDQN" in methods
+    args.Use_COBRA = "COBRA-Oracle" in methods
+    args.Use_HCRL = "HCRL-Oracle" in methods
+
+    # If a teacher model is not selected, disable that teacher instead of
+    # accidentally creating hidden extra work. Add the teacher to --Methods
+    # when you need warm-start/guidance.
+    if "COBRA-Oracle" in methods:
+        if args.COBRA_Teacher_Source != "none" and args.COBRA_Teacher_Source not in methods:
+            print(
+                f"[Method selection] COBRA teacher '{args.COBRA_Teacher_Source}' is not selected. "
+                "Disabling COBRA teacher. Add it to --Methods if you want warm-start/guidance."
+            )
+            args.COBRA_No_Teacher = True
+            args.COBRA_Teacher_Source = "none"
+            args.COBRA_Teacher_Start_Prob = 0.0
+
+    if "HCRL-Oracle" in methods:
+        if args.HCRL_Teacher_Source != "none" and args.HCRL_Teacher_Source not in methods:
+            print(
+                f"[Method selection] HCRL teacher '{args.HCRL_Teacher_Source}' is not selected. "
+                "Disabling HCRL teacher. Add it to --Methods if you want warm-start/guidance."
+            )
+            args.HCRL_No_Teacher = True
+            args.HCRL_Teacher_Source = "none"
+            args.HCRL_Teacher_Start_Prob = 0.0
+
+    return args
+
+
 def parameter_parser():
     parser = argparse.ArgumentParser(description="TCO-DRL / HCRL-Oracle paper experiments")
 
     # ------------------------------------------------------------------
     # General experiment controls
     # ------------------------------------------------------------------
-    parser.add_argument("--Baselines", nargs="+", default=["Random", "Round-Robin", "Earliest", "DQN", "BLOR", "SemiGreedy", "PPO"],
-                        help="Methods to compare. Optional methods are appended by --Use_* flags.")
+    parser.add_argument("--Baselines", nargs="+", default=None,
+                        help="Legacy method list. If omitted, uses the original base baselines. Prefer --Methods for exact selection.")
+    parser.add_argument("--Methods", "--Run_Methods", nargs="+", default=None,
+                        help=("Exact methods to run. This prevents all default baselines from running. "
+                              "Examples: --Methods DQN; --Methods PB; --Methods DQN HCRL. "
+                              "Canonical names: Random Round-Robin Earliest DQN BLOR SemiGreedy PPO "
+                              "RA-DDQN PB-SafeDQN COBRA-Oracle HCRL-Oracle."))
+    parser.add_argument("--Method_Preset", choices=sorted(METHOD_PRESETS.keys()), default=None,
+                        help="Convenience preset for method selection, e.g. base, all, fast, cobra, hcrl, hcrl_only.")
+    parser.add_argument("--List_Methods", action="store_true",
+                        help="Print available method names and presets, then exit.")
     parser.add_argument("--Baseline_num", type=int, default=0)
     parser.add_argument("--Epoch", type=int, default=10)
     parser.add_argument("--Seed", type=int, default=6)
@@ -163,12 +299,9 @@ def parameter_parser():
     parser.add_argument("--Noise_Probability", type=float, default=0.0)
     parser.add_argument("--Noise_Delay", type=float, default=1.0)
     parser.add_argument("--State_Mode", choices=["original", "enhanced"], default="original")
-    parser.add_argument("--Use_GNN_Encoder", action="store_true",
-                        help="Enable graph message-passing oracle encoder.")
-    parser.add_argument("--Disable_GNN_Encoder", action="store_true",
-                        help="Ablation: disable the graph encoder even when HCRL is used.")
-    parser.add_argument("--Use_GNN_For_All_RL", action="store_true",
-                        help="Fairness control: use the same graph encoder for all learning-based RL methods.")
+    parser.add_argument("--Use_GNN_Encoder", action="store_true", help="Enable graph message-passing oracle encoder.")
+    parser.add_argument("--Disable_GNN_Encoder", action="store_true", help="Ablation: disable the graph encoder even when HCRL is used.")
+    parser.add_argument("--Use_GNN_For_All_RL", action="store_true", help="Fairness control: use the same graph encoder for all learning-based RL methods.")
     parser.add_argument("--GNN_Message_Steps", type=int, default=2)
     parser.add_argument("--GNN_Self_Weight", type=float, default=0.55)
     parser.add_argument("--GNN_Neighbor_Weight", type=float, default=0.45)
@@ -184,8 +317,7 @@ def parameter_parser():
     parser.add_argument("--Action_Mask_Mode", choices=["none", "type"], default="none")
     parser.add_argument("--Fatigue_Strength", type=float, default=1.0)
     parser.add_argument("--Burstiness", type=float, default=0.80)
-    parser.add_argument("--Expose_Validation_Prob", action="store_true",
-                        help="Expose true validation probabilities in enhanced state. Disabled by default to avoid leakage.")
+    parser.add_argument("--Expose_Validation_Prob", action="store_true", help="Expose true validation probabilities in enhanced state. Disabled by default to avoid leakage.")
     parser.add_argument("--Harder_Request_DDL", type=float, default=6.6)
 
     parser.add_argument("--W_SUCCESS", type=float, default=2.2)
@@ -200,6 +332,15 @@ def parameter_parser():
     parser.add_argument("--Reward_Scale", type=float, default=3.0)
 
     args = parser.parse_args()
+
+    if args.List_Methods:
+        print("Available canonical methods:")
+        for m in ALL_METHODS:
+            print("  -", m)
+        print("\nAvailable presets:")
+        for k in sorted(METHOD_PRESETS.keys()):
+            print(f"  - {k}: {' '.join(METHOD_PRESETS[k])}")
+        raise SystemExit(0)
 
     # Stress scenario defaults.
     if args.Scenario in ["validation_stress", "rl_hard", "rl_harder"]:
@@ -241,15 +382,8 @@ def parameter_parser():
         if args.RA_start_learn == 300:
             args.RA_start_learn = 200
 
-    # Append optional methods.
-    if args.Use_RA_DDQN and "RA-DDQN" not in args.Baselines:
-        args.Baselines.append("RA-DDQN")
-    if args.Use_PB_SafeDQN and "PB-SafeDQN" not in args.Baselines:
-        args.Baselines.append("PB-SafeDQN")
-    if args.Use_COBRA and "COBRA-Oracle" not in args.Baselines:
-        args.Baselines.append("COBRA-Oracle")
-    if args.Use_HCRL and "HCRL-Oracle" not in args.Baselines:
-        args.Baselines.append("HCRL-Oracle")
+    # Resolve final selected methods after scenario defaults and before GNN/teacher logic.
+    args = _resolve_selected_methods(args)
 
     # Full HCRL uses GNN by default, but the ablation can disable it.
     if args.Use_HCRL and not args.Disable_GNN_Encoder:
@@ -268,6 +402,10 @@ def parameter_parser():
 
     _generate_oracle_community(args)
     args.Baseline_num = len(args.Baselines)
+
+    print(f"[Method selection] mode: {args.Method_Selection_Mode}")
+    print(f"[Method selection] running methods: {args.Baselines}")
+
     return args
 
 
@@ -325,8 +463,11 @@ def _generate_oracle_community(args):
                 }[role]
 
             cost, acc, tokens, behavior, validation, fatigue = params
-            oracle_cost.append(cost); oracle_acc.append(acc); oracle_tokens.append(tokens)
-            oracle_behavior_probs.append(behavior); oracle_validation_probs.append(validation)
+            oracle_cost.append(cost)
+            oracle_acc.append(acc)
+            oracle_tokens.append(tokens)
+            oracle_behavior_probs.append(behavior)
+            oracle_validation_probs.append(validation)
             oracle_fatigue_sensitivity.append(fatigue)
             if role == "malicious":
                 malicious_index.append(idx)
