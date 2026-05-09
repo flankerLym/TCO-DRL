@@ -3,10 +3,17 @@ from scipy import stats
 
 
 class SchedulingEnv:
-    """Scalable oracle-selection simulation environment.
+    """Scalable oracle-selection environment for TCO-DRL / HCRL-Oracle.
 
-    This replacement keeps the original TCO-DRL metrics and baseline names, but removes
-    hard-coded 15-oracle assumptions so that Oracle_Num can scale to 30/60/105+.
+    This file is a complete replacement for the original simulation environment.
+    It keeps the public methods used by main.py while completing the paper-version
+    implementation:
+      - scalable oracle communities;
+      - validation-aware success and risk-aware reward;
+      - type action masks;
+      - primary-backup recovery for PB-SafeDQN / COBRA-Oracle;
+      - hierarchical constrained feedback for HCRL-Oracle;
+      - graph message-passing oracle encoder with HCRL-only and all-RL modes.
     """
 
     def __init__(self, args):
@@ -14,54 +21,54 @@ class SchedulingEnv:
         self.policy_names = list(args.Baselines)
         self.policy_num = len(self.policy_names)
         self.policy_name_to_id = {name: idx for idx, name in enumerate(self.policy_names)}
-
-        # Oracle settings
-        self.oracleTypes = np.array(args.Oracle_Type, dtype=int)
-        self.oracleNum = int(args.Oracle_Num)
-        assert self.oracleNum == len(self.oracleTypes), "Oracle_Num must equal len(Oracle_Type)"
-        self.oracleCapacity = args.Oracle_capacity
-        self.actionNum = self.oracleNum
-        self.oracleInitialReputation = args.Oracle_Initial_Reputation
-        self.oracleAcc = np.array(args.Oracle_Acc, dtype=float)
-        self.oracleCost = np.array(args.Oracle_Cost, dtype=float)
-        self.oracleToken = np.array(args.Oracle_Tokens, dtype=float)
-        self.oracleBehaviorProbs = np.array(args.Oracle_Behavior_Probs, dtype=float)
-        self.oracleValidationProbs = np.array(args.Oracle_Validation_Probs, dtype=float)
-        self.oracleFatigueSensitivity = np.array(getattr(args, "Oracle_Fatigue_Sensitivity", [0.0] * self.oracleNum), dtype=float)
-        self.malicious_oracles = list(args.Malicious_Oracle_Index)
-        self.normal_oracles = list(args.Normal_Oracle_Index)
-        self.trusted_oracles = list(args.Trusted_Oracle_Index)
-
-        # Request settings
-        self.requestMI = args.Request_len_Mean
-        self.requestMI_std = args.Request_len_Std
-        self.requestNum = int(args.Request_Num)
-        self.lamda = args.lamda
-        self.ddl = args.Request_ddl
-        self.noise_probability = args.Noise_Probability
-        self.noise_delay = args.Noise_Delay
-
-        # State dimension
-        if args.State_Mode == "original":
-            # request type + oracle wait time + oracle reputation
-            self.s_features = 1 + 2 * self.oracleNum
-        else:
-            # request type, request length, ddl + wait + reputation + cost + acc +
-            # type_match + base validation prob + recent success rate + recent load
-            self.s_features = 3 + 8 * self.oracleNum
-
-        # Reputation settings
-        self.timewindowSize = args.Time_Window_Size
-        self.timeperiodSize = args.Time_Period_Size
-        self.timeperiodNum = int(self.requestNum / self.timeperiodSize) + 2
-
+        self._load_static_settings(args)
+        self._init_state_shape()
         self.arrival_Times = np.zeros(self.requestNum)
         self.requestsMI = np.zeros(self.requestNum)
         self.lengths = np.zeros(self.requestNum)
         self.request_type = np.zeros(self.requestNum, dtype=int)
-
         self._init_policy_records()
         self.gen_workload(self.lamda)
+
+    # ------------------------------------------------------------------
+    # Initialization and workload
+    # ------------------------------------------------------------------
+    def _load_static_settings(self, args):
+        self.oracleTypes = np.asarray(args.Oracle_Type, dtype=int)
+        self.oracleNum = int(args.Oracle_Num)
+        if self.oracleNum != len(self.oracleTypes):
+            raise ValueError("Oracle_Num must equal len(Oracle_Type)")
+        self.oracleCapacity = float(args.Oracle_capacity)
+        self.actionNum = self.oracleNum
+        self.oracleInitialReputation = float(args.Oracle_Initial_Reputation)
+        self.oracleAcc = np.asarray(args.Oracle_Acc, dtype=float)
+        self.oracleCost = np.asarray(args.Oracle_Cost, dtype=float)
+        self.oracleToken = np.asarray(args.Oracle_Tokens, dtype=float)
+        self.oracleBehaviorProbs = np.asarray(args.Oracle_Behavior_Probs, dtype=float)
+        self.oracleValidationProbs = np.asarray(args.Oracle_Validation_Probs, dtype=float)
+        self.oracleFatigueSensitivity = np.asarray(getattr(args, "Oracle_Fatigue_Sensitivity", [0.0] * self.oracleNum), dtype=float)
+        self.malicious_oracles = list(getattr(args, "Malicious_Oracle_Index", []))
+        self.normal_oracles = list(getattr(args, "Normal_Oracle_Index", []))
+        self.trusted_oracles = list(getattr(args, "Trusted_Oracle_Index", []))
+
+        self.requestMI = float(args.Request_len_Mean)
+        self.requestMI_std = float(args.Request_len_Std)
+        self.requestNum = int(args.Request_Num)
+        self.lamda = float(args.lamda)
+        self.ddl = float(args.Request_ddl)
+        self.noise_probability = float(args.Noise_Probability)
+        self.noise_delay = float(args.Noise_Delay)
+        self.timewindowSize = int(args.Time_Window_Size)
+        self.timeperiodSize = int(args.Time_Period_Size)
+        self.timeperiodNum = int(self.requestNum / max(self.timeperiodSize, 1)) + 2
+
+    def _init_state_shape(self):
+        if self.args.State_Mode == "original":
+            self.s_features = 1 + 2 * self.oracleNum
+        else:
+            # request type, request length, deadline + eight features per oracle.
+            # GNN keeps the same per-oracle dimensionality, so all existing models remain compatible.
+            self.s_features = 3 + 8 * self.oracleNum
 
     def _init_policy_records(self):
         self.events = {}
@@ -69,38 +76,31 @@ class SchedulingEnv:
         self.reputation_factors = {}
         self.oracle_reputation_history = {}
         self.reputation_timewindow = {}
-
         for name in self.policy_names:
-            # request events rows:
-            # 0 oracle id, 1 start time, 2 wait time, 3 duration, 4 leave time,
-            # 5 reward, 6 base exeT, 7 success, 8 cost, 9 success_without_type
-            self.events[name] = np.zeros((10, self.requestNum))
-            # oracle events rows:
-            # 0 idleT, 1 assigned request num, 2 reputation, 3 match num, 4 successful validation num
-            self.oracle_events[name] = np.zeros((5, self.oracleNum))
+            # rows: 0 oracle, 1 startT, 2 waitT, 3 duration, 4 leaveT, 5 reward,
+            # 6 exeT, 7 final success, 8 cost, 9 type match
+            self.events[name] = np.zeros((10, self.requestNum), dtype=float)
+            # rows: 0 idleT, 1 assigned count, 2 reputation, 3 type matches, 4 validation successes
+            self.oracle_events[name] = np.zeros((5, self.oracleNum), dtype=float)
             self.oracle_events[name][2] = self.oracleInitialReputation
-            self.reputation_factors[name] = np.zeros((4, self.oracleNum))
-            self.oracle_reputation_history[name] = np.zeros((self.timeperiodNum, self.oracleNum))
-            self.reputation_timewindow[name] = np.zeros((0, self.oracleNum))
+            # rows: 0 count, 1 validation successes, 2 total duration, 3 behavior-risk sum
+            self.reputation_factors[name] = np.zeros((4, self.oracleNum), dtype=float)
+            self.oracle_reputation_history[name] = np.zeros((self.timeperiodNum, self.oracleNum), dtype=float)
+            self.reputation_timewindow[name] = np.zeros((0, self.oracleNum), dtype=float)
 
-        # Primary-backup / committee diagnostic records. Rows:
-        # 0 primary_success, 1 backup_used, 2 backup_success, 3 backup_recovery,
+        # rows: 0 primary_success, 1 backup_used, 2 backup_success, 3 backup_recovery,
         # 4 primary_action, 5 backup_action, 6 primary_malicious, 7 backup_malicious,
-        # 8 primary_trusted, 9 backup_trusted, 10 backup_skipped_by_trigger,
-        # 11 selected_backup_score,
-        # 12 HCRL mode index (0=single,1=serial,2=parallel),
-        # 13 single_mode flag, 14 serial_mode flag, 15 parallel_mode flag,
-        # 16 constraint violation flag, 17 cost violation magnitude,
-        # 18 latency violation magnitude, 19 risk violation magnitude,
-        # 20 lambda_cost, 21 lambda_latency, 22 lambda_risk.
-        # Values remain zero for non-primary-backup policies.
-        self.pb_records = {name: np.zeros((23, self.requestNum)) for name in self.policy_names}
+        # 8 primary_trusted, 9 backup_trusted, 10 backup_skipped,
+        # 11 backup_score, 12 HCRL mode, 13 single, 14 serial, 15 parallel,
+        # 16 any constraint violation, 17 cost violation, 18 latency violation,
+        # 19 risk violation, 20 lambda cost, 21 lambda latency, 22 lambda risk.
+        self.pb_records = {name: np.zeros((23, self.requestNum), dtype=float) for name in self.policy_names}
         for name in self.policy_names:
             self.pb_records[name][4, :] = -1
             self.pb_records[name][5, :] = -1
-        # Recent backup utility histories for adaptive COBRA gates.
+            self.pb_records[name][12, :] = -1
+
         self.backup_score_history = {name: [] for name in self.policy_names}
-        # Dynamic Lagrange multipliers for HCRL primal-dual constrained RL.
         self.hcrl_lambdas = {
             name: {
                 "cost": float(getattr(self.args, "HCRL_Lambda_Cost", 0.55)),
@@ -110,70 +110,13 @@ class SchedulingEnv:
             for name in self.policy_names
         }
 
-    def gen_workload(self, lamda):
-        intervalT = stats.expon.rvs(scale=1 / lamda * 60, size=self.requestNum)
-        print("intervalT mean: ", round(np.mean(intervalT), 3),
-              '  intervalT SD:', round(np.std(intervalT, ddof=1), 3))
-        self.arrival_Times = np.around(intervalT.cumsum(), decimals=3)
-        print('last request arrivalT:', round(self.arrival_Times[-1], 3))
-
-        self.requestsMI = np.random.normal(self.requestMI, self.requestMI_std, self.requestNum).astype(int)
-        print("MI mean: ", round(np.mean(self.requestsMI), 3),
-              '  MI SD:', round(np.std(self.requestsMI, ddof=1), 3))
-        self.lengths = self.requestsMI / self.oracleCapacity
-        print("length mean: ", round(np.mean(self.lengths), 3),
-              '  length SD:', round(np.std(self.lengths, ddof=1), 3))
-
-        service_type_num = int(np.max(self.oracleTypes)) + 1
-        if getattr(self.args, "Scenario", "static") in ["rl_hard", "rl_harder"]:
-            # Bursty correlated requests: a one-step greedy policy tends to repeatedly
-            # hit the same cheap same-type oracle, triggering fatigue. RL agents can
-            # observe recent load/success features and learn to distribute selections.
-            burstiness = float(getattr(self.args, "Burstiness", 0.80))
-            types = np.zeros(self.requestNum, dtype=int)
-            types[0] = np.random.randint(0, service_type_num)
-            for i in range(1, self.requestNum):
-                if np.random.rand() < burstiness:
-                    types[i] = types[i - 1]
-                else:
-                    types[i] = np.random.randint(0, service_type_num)
-            self.request_type = types
-        else:
-            probs = [1.0 / service_type_num] * service_type_num
-            self.request_type = np.random.choice(list(range(service_type_num)), size=self.requestNum, p=probs)
-
     def reset(self, args):
         self.args = args
         self.policy_names = list(args.Baselines)
         self.policy_num = len(self.policy_names)
         self.policy_name_to_id = {name: idx for idx, name in enumerate(self.policy_names)}
-
-        self.oracleTypes = np.array(args.Oracle_Type, dtype=int)
-        self.oracleNum = int(args.Oracle_Num)
-        self.actionNum = self.oracleNum
-        self.oracleAcc = np.array(args.Oracle_Acc, dtype=float)
-        self.oracleCost = np.array(args.Oracle_Cost, dtype=float)
-        self.oracleToken = np.array(args.Oracle_Tokens, dtype=float)
-        self.oracleBehaviorProbs = np.array(args.Oracle_Behavior_Probs, dtype=float)
-        self.oracleValidationProbs = np.array(args.Oracle_Validation_Probs, dtype=float)
-        self.oracleFatigueSensitivity = np.array(getattr(args, "Oracle_Fatigue_Sensitivity", [0.0] * self.oracleNum), dtype=float)
-        self.malicious_oracles = list(args.Malicious_Oracle_Index)
-        self.normal_oracles = list(args.Normal_Oracle_Index)
-        self.trusted_oracles = list(args.Trusted_Oracle_Index)
-
-        self.requestNum = int(args.Request_Num)
-        self.ddl = args.Request_ddl
-        self.noise_probability = args.Noise_Probability
-        self.noise_delay = args.Noise_Delay
-        self.timewindowSize = args.Time_Window_Size
-        self.timeperiodSize = args.Time_Period_Size
-        self.timeperiodNum = int(self.requestNum / self.timeperiodSize) + 2
-
-        if args.State_Mode == "original":
-            self.s_features = 1 + 2 * self.oracleNum
-        else:
-            self.s_features = 3 + 8 * self.oracleNum
-
+        self._load_static_settings(args)
+        self._init_state_shape()
         self.arrival_Times = np.zeros(self.requestNum)
         self.requestsMI = np.zeros(self.requestNum)
         self.lengths = np.zeros(self.requestNum)
@@ -181,323 +124,449 @@ class SchedulingEnv:
         self._init_policy_records()
         self.gen_workload(args.lamda)
 
+    def gen_workload(self, lamda):
+        lamda = max(float(lamda), 1e-8)
+        intervalT = stats.expon.rvs(scale=1.0 / lamda * 60.0, size=self.requestNum)
+        self.arrival_Times = np.around(intervalT.cumsum(), decimals=3)
+        self.requestsMI = np.maximum(
+            np.random.normal(self.requestMI, self.requestMI_std, self.requestNum).astype(int), 1
+        )
+        self.lengths = self.requestsMI / max(self.oracleCapacity, 1e-8)
+
+        service_type_num = int(np.max(self.oracleTypes)) + 1
+        if getattr(self.args, "Scenario", "static") in ["rl_hard", "rl_harder"]:
+            burstiness = float(getattr(self.args, "Burstiness", 0.80))
+            types = np.zeros(self.requestNum, dtype=int)
+            types[0] = np.random.randint(0, service_type_num)
+            for i in range(1, self.requestNum):
+                types[i] = types[i - 1] if np.random.rand() < burstiness else np.random.randint(0, service_type_num)
+            self.request_type = types
+        else:
+            self.request_type = np.random.choice(np.arange(service_type_num), size=self.requestNum)
+
+        print("intervalT mean: ", round(np.mean(intervalT), 3), "  intervalT SD:", round(np.std(intervalT, ddof=1), 3))
+        print("last request arrivalT:", round(float(self.arrival_Times[-1]), 3))
+        print("MI mean: ", round(float(np.mean(self.requestsMI)), 3), "  MI SD:", round(float(np.std(self.requestsMI, ddof=1)), 3))
+        print("length mean: ", round(float(np.mean(self.lengths)), 3), "  length SD:", round(float(np.std(self.lengths, ddof=1)), 3))
+
+    def workload(self, request_count):
+        request_id = int(request_count) - 1
+        attrs = [
+            request_id,
+            float(self.arrival_Times[request_id]),
+            float(self.lengths[request_id]),
+            int(self.request_type[request_id]),
+            float(self.ddl),
+        ]
+        return request_count == self.requestNum, attrs
+
+    # ------------------------------------------------------------------
+    # Reputation and state encoding
+    # ------------------------------------------------------------------
+    def initial_reputation(self):
+        for name in self.policy_names:
+            self.oracle_events[name][2] = self.oracleInitialReputation
+
     def reset_reputation_factors(self):
         for name in self.policy_names:
             if name != "BLOR":
-                self.reputation_factors[name] = np.zeros((4, self.oracleNum))
+                self.reputation_factors[name] = np.zeros((4, self.oracleNum), dtype=float)
 
     def reset_reputation_factors_BLOR(self):
         if "BLOR" in self.policy_names:
-            self.reputation_factors["BLOR"] = np.zeros((4, self.oracleNum))
+            self.reputation_factors["BLOR"] = np.zeros((4, self.oracleNum), dtype=float)
 
-    def workload(self, request_count):
-        request_id = request_count - 1
-        request_attributes = [
-            request_id,
-            self.arrival_Times[request_id],
-            self.lengths[request_id],
-            int(self.request_type[request_id]),
-            self.ddl,
-        ]
-        return request_count == self.requestNum, request_attributes
+    def get_reputation_factors(self, policy_name):
+        return self.reputation_factors[policy_name]
 
-    def _original_reward(self, exeT, durationT, cost, reputation, request_type, oracle_type):
-        penalty = 0 if request_type == oracle_type else 1
-        return (1 + 2.5 * np.exp(1.5 - cost)) * (exeT / max(durationT, 1e-8)) + reputation - 4 * penalty
+    def update_reputation(self, reputation_attributes, time_period, policy_name):
+        counts = reputation_attributes[0]
+        val = reputation_attributes[1]
+        behavior = reputation_attributes[3]
+        old = self.oracle_events[policy_name][2]
+        recent_success = (val + self.oracleInitialReputation * 2.0) / np.maximum(counts + 2.0, 1e-8)
+        behavior_penalty = np.log1p(np.maximum(behavior / np.maximum(counts, 1.0), 0.0)) / np.log1p(100.0)
+        new_rep = np.clip(0.70 * old + 0.30 * (recent_success - 0.35 * behavior_penalty), 0.0, 1.0)
+        self.oracle_events[policy_name][2] = new_rep
+        tp = int(min(max(time_period, 0), self.timeperiodNum - 1))
+        self.oracle_reputation_history[policy_name][tp] = new_rep
+        self.reputation_timewindow[policy_name] = np.vstack((self.reputation_timewindow[policy_name], new_rep[None, :]))[-self.timewindowSize:]
 
-    def _risk_aware_reward(self, reputation, match, successful_validation, cost, durationT, ddl, behavior_record):
-        """Bounded success-aligned risk-aware reward (tuned).
+    def _policy_uses_gnn(self, policy_name):
+        if not getattr(self.args, "Use_GNN_Encoder", False):
+            return False
+        if getattr(self.args, "Disable_GNN_Encoder", False):
+            return False
+        if policy_name == "HCRL-Oracle":
+            return True
+        if getattr(self.args, "Use_GNN_For_All_RL", False) and policy_name in ["DQN", "PPO", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle"]:
+            return True
+        return False
 
-        Design goal:
-        1) keep every one-step reward small and clipped;
-        2) align the objective with validation-aware success;
-        3) prevent RA-DDQN from becoming too conservative by over-selecting
-           expensive trusted oracles that cause queueing/timeouts.
+    def getState(self, request_attrs, policy_name):
+        request_id, arrival_time, length, request_type, ddl = request_attrs
+        request_type = int(request_type)
+        if self.args.State_Mode == "original":
+            state = np.hstack(([request_type], self.oracle_events[policy_name][0] - arrival_time, self.oracle_events[policy_name][2]))
+            return np.nan_to_num(state.astype(float), nan=0.0, posinf=10.0, neginf=-10.0)
 
-        Therefore the dominant positive term is direct task success
-        (on-time + type match + validation), while reputation is a small
-        regularizer. Cost, latency, timeout and abnormal behavior are explicit
-        penalties. This keeps reward values interpretable and avoids the
-        previous "high reward but lower success_rate" mismatch.
-        """
-        args = self.args
+        oracle_features = self._base_oracle_features(request_attrs, policy_name)
+        if self._policy_uses_gnn(policy_name):
+            oracle_features = self._graph_encode_oracles(oracle_features, request_type)
+        prefix = np.array([
+            request_type / max(float(np.max(self.oracleTypes)), 1.0),
+            float(length) / max(float(getattr(self.args, "Request_len_Mean", 6000)) / max(float(getattr(self.args, "Oracle_capacity", 1000)), 1e-8), 1e-8),
+            float(ddl) / max(float(getattr(self.args, "Harder_Request_DDL", 6.6)), 1e-8),
+        ], dtype=float)
+        state = np.hstack((prefix, oracle_features.reshape(-1)))
+        return np.nan_to_num(state.astype(float), nan=0.0, posinf=10.0, neginf=-10.0)
 
-        ddl = max(float(ddl), 1e-8)
-        timeout = 1.0 if durationT > ddl else 0.0
-        on_time = 1.0 - timeout
+    def _base_oracle_features(self, request_attrs, policy_name):
+        _, arrival_time, length, request_type, ddl = request_attrs
+        request_type = int(request_type)
+        wait = np.maximum(self.oracle_events[policy_name][0] - float(arrival_time), 0.0)
+        wait_norm = np.clip(wait / max(float(ddl), 1e-8), 0.0, 3.0) / 3.0
+        rep = np.clip(self.oracle_events[policy_name][2], 0.0, 1.0)
+        cost_norm = np.clip(self.oracleCost / max(float(np.max(self.oracleCost)), 1e-8), 0.0, 1.0)
+        acc_norm = np.clip(self.oracleAcc / max(float(np.max(self.oracleAcc)), 1e-8), 0.0, 1.0)
+        type_match = (self.oracleTypes == request_type).astype(float)
 
-        rep_score = 0.5 * (np.tanh(float(reputation)) + 1.0)
-        match_score = float(match)
-        val_score = float(successful_validation)
-        task_success = float(match_score * val_score * on_time)
+        counts = self.reputation_factors[policy_name][0]
+        val = self.reputation_factors[policy_name][1]
+        prior = 0.5 * rep + 0.5 * np.clip(self.oracleToken / max(float(np.max(self.oracleToken)), 1e-8), 0.0, 1.0)
+        observed_success = (val + 2.0 * prior) / np.maximum(counts + 2.0, 1e-8)
+        validation_feature = np.asarray(self.oracleValidationProbs if getattr(self.args, "Expose_Validation_Prob", False) else observed_success, dtype=float)
+        recent_load = np.clip(counts / max(float(self.timeperiodSize), 1.0), 0.0, 1.0)
+        behavior = self.reputation_factors[policy_name][3] / np.maximum(counts, 1.0)
+        behavior_risk = np.clip(np.log1p(np.maximum(behavior, 0.0)) / np.log1p(100.0), 0.0, 1.0)
+        delay_est = np.clip((wait + float(length) / np.maximum(self.oracleAcc, 1e-8)) / max(float(ddl), 1e-8), 0.0, 2.0) / 2.0
 
-        cost_score = float(np.clip(cost, 0.0, 1.25) / 1.25)
-        response_ratio = float(np.clip(durationT / ddl, 0.0, 2.5))
-        # Softer below deadline, rapidly worse after deadline.
-        response_penalty = min(response_ratio, 1.0) * 0.4 + max(response_ratio - 1.0, 0.0) * 0.9
-        response_penalty = float(np.clip(response_penalty, 0.0, 1.0))
-        behavior_risk = float(np.log1p(max(float(behavior_record), 0.0)) / np.log1p(100.0))
+        return np.vstack((wait_norm, rep, cost_norm, acc_norm, type_match, validation_feature, recent_load, 0.5 * behavior_risk + 0.5 * delay_est)).T
 
-        positive = (
-            args.W_SUCCESS * task_success
-            + args.W_VALIDATION * val_score
-            + args.W_MATCH * match_score
-            + args.W_REPUTATION * rep_score
+    def _graph_encode_oracles(self, features, request_type):
+        h = np.asarray(features, dtype=float).copy()
+        n = h.shape[0]
+        if n == 0:
+            return h
+        same_service = (self.oracleTypes[:, None] == self.oracleTypes[None, :]).astype(float)
+        reliability = 1.0 - np.abs(h[:, 5][:, None] - h[:, 5][None, :])
+        load_similarity = 1.0 - np.abs(h[:, 6][:, None] - h[:, 6][None, :])
+        cost_similarity = 1.0 - np.abs(h[:, 2][:, None] - h[:, 2][None, :])
+        adj = (
+            float(getattr(self.args, "GNN_Service_Weight", 1.0)) * same_service
+            + float(getattr(self.args, "GNN_Reliability_Weight", 0.45)) * reliability
+            + float(getattr(self.args, "GNN_Load_Weight", 0.35)) * load_similarity
+            + float(getattr(self.args, "GNN_Cost_Weight", 0.25)) * cost_similarity
         )
-        negative = (
-            args.W_COST * cost_score
-            + args.W_RESPONSE * response_penalty
-            + args.W_BEHAVIOR * behavior_risk
-            + args.W_TIMEOUT * timeout
-            + 0.8 * (1.0 - task_success)
-        )
+        np.fill_diagonal(adj, 0.0)
+        row_sum = np.maximum(adj.sum(axis=1, keepdims=True), 1e-8)
+        adj = adj / row_sum
+        self_w = float(getattr(self.args, "GNN_Self_Weight", 0.55))
+        neigh_w = float(getattr(self.args, "GNN_Neighbor_Weight", 0.45))
+        steps = int(getattr(self.args, "GNN_Message_Steps", 2))
+        request_gate = (self.oracleTypes == int(request_type)).astype(float)[:, None]
+        for _ in range(max(steps, 0)):
+            msg = adj.dot(h)
+            h = np.tanh(self_w * h + neigh_w * msg + 0.05 * request_gate)
+        return np.clip(0.5 * (h + 1.0), 0.0, 1.0)
 
-        normalizer = (
-            args.W_SUCCESS + args.W_VALIDATION + args.W_MATCH + args.W_REPUTATION
-            + args.W_COST + args.W_RESPONSE + args.W_BEHAVIOR + args.W_TIMEOUT
-            + 0.8
-        )
-        raw = (positive - negative) / max(normalizer, 1e-8)
-        reward = float(args.Reward_Scale * raw)
-        return float(np.clip(reward, -args.Reward_Clip, args.Reward_Clip))
+    def get_action_mask(self, request_attrs):
+        if getattr(self.args, "Action_Mask_Mode", "none") != "type":
+            return np.ones(self.oracleNum, dtype=bool)
+        mask = self.oracleTypes == int(request_attrs[3])
+        if not np.any(mask):
+            mask[:] = True
+        return mask.astype(bool)
 
+    def get_backup_action_mask(self, request_attrs, primary_action):
+        mask = self.get_action_mask(request_attrs).astype(bool)
+        if 0 <= int(primary_action) < self.oracleNum:
+            mask[int(primary_action)] = False
+        if not np.any(mask):
+            mask[:] = True
+            if 0 <= int(primary_action) < self.oracleNum:
+                mask[int(primary_action)] = False
+        if not np.any(mask):
+            mask[:] = True
+        return mask.astype(bool)
+
+    # ------------------------------------------------------------------
+    # Core simulation and feedback
+    # ------------------------------------------------------------------
     def _effective_validation_prob(self, action, policy_name):
-        """Dynamic validation probability under rl_hard.
-
-        In rl_hard, low-cost bait oracles fatigue when over-used within the current
-        reputation period. This makes the environment unfavorable to one-step greedy
-        policies that always choose the cheapest matching oracle.
-        """
-        base_prob = float(self.oracleValidationProbs[action])
+        base = float(self.oracleValidationProbs[int(action)])
         if getattr(self.args, "Scenario", "static") not in ["rl_hard", "rl_harder"]:
-            return base_prob
-        recent_assigned = float(self.reputation_factors[policy_name][0, action])
-        avg_recent = max(self.timeperiodSize / max(self.oracleNum, 1), 1e-6)
-        load_ratio = recent_assigned / avg_recent
-        # no penalty below average load. rl_harder uses a stronger delayed trap:
-        # fatigue grows faster after repeated selection during bursty traffic.
-        overload = max(0.0, load_ratio - 1.0)
-        scenario = getattr(self.args, "Scenario", "static")
-        if scenario == "rl_harder":
+            return base
+        recent_assigned = float(self.reputation_factors[policy_name][0, int(action)])
+        avg_recent = max(self.timeperiodSize / max(self.oracleNum, 1), 1e-8)
+        overload = max(0.0, recent_assigned / avg_recent - 1.0)
+        if getattr(self.args, "Scenario", "static") == "rl_harder":
             fatigue_growth = np.sqrt(overload) + 0.35 * overload
             min_prob = 0.02
         else:
             fatigue_growth = np.log1p(overload)
             min_prob = 0.05
-        fatigue = float(getattr(self.args, "Fatigue_Strength", 1.0)) * float(self.oracleFatigueSensitivity[action]) * fatigue_growth
-        return float(np.clip(base_prob - fatigue, min_prob, 0.99))
-
-    def get_action_mask(self, request_attrs):
-        """Boolean mask for type-constrained RL action space."""
-        if getattr(self.args, "Action_Mask_Mode", "none") != "type":
-            return np.ones(self.oracleNum, dtype=bool)
-        request_type = int(request_attrs[3])
-        mask = self.oracleTypes == request_type
-        if not np.any(mask):
-            mask[:] = True
-        return mask.astype(bool)
+        fatigue = float(getattr(self.args, "Fatigue_Strength", 1.0)) * float(self.oracleFatigueSensitivity[int(action)]) * fatigue_growth
+        return float(np.clip(base - fatigue, min_prob, 0.99))
 
     def _simulate_oracle_attempt(self, request_attrs, action, policy_name, arrival_override=None):
-        """Simulate one oracle attempt without writing request-level metrics.
-
-        This helper is used by PB-SafeDQN, where a request may involve a primary
-        and a backup oracle. It returns the attempt-level timing, validation,
-        behavior and role information. The caller decides whether the request is
-        finally successful and then writes the combined result into self.events.
-        """
         request_id, arrival_time, length, request_type, ddl = request_attrs
-        request_type = int(request_type)
         action = int(action)
         effective_arrival = float(arrival_time if arrival_override is None else arrival_override)
-
-        acc = self.oracleAcc[action]
-        cost = self.oracleCost[action]
+        acc = max(float(self.oracleAcc[action]), 1e-8)
+        cost = float(self.oracleCost[action])
         oracle_type = int(self.oracleTypes[action])
-        validation_prob = self._effective_validation_prob(action, policy_name)
-        behavior_probs = self.oracleBehaviorProbs[action]
-
-        idleT = self.oracle_events[policy_name][0, action]
-        reputation = self.oracle_events[policy_name][2, action]
-        exeT = length / acc
+        idleT = float(self.oracle_events[policy_name][0, action])
+        reputation = float(self.oracle_events[policy_name][2, action])
+        exeT = float(length) / acc
         waitT = max(idleT - effective_arrival, 0.0)
         startT = effective_arrival + waitT
-        exe_time = (length * 1.05) / acc if action in self.malicious_oracles else exeT
+        exe_time = exeT * (1.05 if action in self.malicious_oracles else 1.0)
         if np.random.rand() < self.noise_probability:
-            real_exeT = exe_time + self.noise_delay
-        else:
-            real_exeT = exe_time
-        durationT = waitT + real_exeT
-        leaveT = startT + real_exeT
-        match = 1 if request_type == oracle_type else 0
-        validation_raw = 1 if np.random.rand() < validation_prob else 0
-        behavior_record = np.random.choice([0, 1, 5, 100], p=behavior_probs)
+            exe_time += self.noise_delay
+        durationT = waitT + exe_time
+        leaveT = startT + exe_time
+        match = 1 if int(request_type) == oracle_type else 0
+        validation_raw = 1 if np.random.rand() < self._effective_validation_prob(action, policy_name) else 0
+        probs = np.asarray(self.oracleBehaviorProbs[action], dtype=float)
+        probs = probs / max(probs.sum(), 1e-8)
+        behavior_record = float(np.random.choice([0, 1, 5, 100], p=probs))
         return {
-            "action": action,
-            "startT": startT,
-            "waitT": waitT,
-            "exeT": exeT,
-            "durationT": durationT,
-            "leaveT": leaveT,
-            "cost": cost,
-            "reputation": reputation,
-            "match": match,
-            "validation_raw": validation_raw,
-            "behavior_record": behavior_record,
+            "action": action, "startT": startT, "waitT": waitT, "exeT": exeT,
+            "durationT": durationT, "leaveT": leaveT, "cost": cost, "reputation": reputation,
+            "match": match, "validation_raw": validation_raw, "behavior_record": behavior_record,
             "oracle_type": oracle_type,
             "is_malicious": 1 if action in self.malicious_oracles else 0,
             "is_trusted": 1 if action in self.trusted_oracles else 0,
         }
 
+    def _is_success(self, attempt, ddl):
+        if getattr(self.args, "Success_Mode", "original") == "validation_aware":
+            return int(attempt["durationT"] <= ddl and attempt["match"] == 1 and attempt["validation_raw"] == 1)
+        return int(attempt["durationT"] <= ddl and attempt["match"] == 1)
+
+    def _original_reward(self, exeT, durationT, cost, reputation, request_type, oracle_type):
+        penalty = 0 if int(request_type) == int(oracle_type) else 1
+        return float((1 + 2.5 * np.exp(1.5 - float(cost))) * (float(exeT) / max(float(durationT), 1e-8)) + float(reputation) - 4 * penalty)
+
+    def _risk_aware_reward(self, reputation, match, successful_validation, cost, durationT, ddl, behavior_record):
+        ddl = max(float(ddl), 1e-8)
+        timeout = 1.0 if float(durationT) > ddl else 0.0
+        on_time = 1.0 - timeout
+        rep_score = 0.5 * (np.tanh(float(reputation)) + 1.0)
+        match_score = float(match)
+        val_score = float(successful_validation)
+        task_success = match_score * val_score * on_time
+        cost_score = float(np.clip(float(cost), 0.0, 1.25) / 1.25)
+        response_ratio = float(np.clip(float(durationT) / ddl, 0.0, 2.5))
+        response_penalty = float(np.clip(min(response_ratio, 1.0) * 0.4 + max(response_ratio - 1.0, 0.0) * 0.9, 0.0, 1.0))
+        behavior_risk = float(np.log1p(max(float(behavior_record), 0.0)) / np.log1p(100.0))
+        a = self.args
+        positive = a.W_SUCCESS * task_success + a.W_VALIDATION * val_score + a.W_MATCH * match_score + a.W_REPUTATION * rep_score
+        negative = a.W_COST * cost_score + a.W_RESPONSE * response_penalty + a.W_BEHAVIOR * behavior_risk + a.W_TIMEOUT * timeout + 0.8 * (1.0 - task_success)
+        normalizer = a.W_SUCCESS + a.W_VALIDATION + a.W_MATCH + a.W_REPUTATION + a.W_COST + a.W_RESPONSE + a.W_BEHAVIOR + a.W_TIMEOUT + 0.8
+        return float(np.clip(a.Reward_Scale * (positive - negative) / max(normalizer, 1e-8), -a.Reward_Clip, a.Reward_Clip))
+
+    def _reward_for_attempt(self, attempt, request_attrs, final_success=None, total_cost=None, final_duration=None, combined_behavior=None, combined_rep=None):
+        _, _, _, request_type, ddl = request_attrs
+        if getattr(self.args, "Reward_Mode", "original") == "risk_aware":
+            return self._risk_aware_reward(
+                combined_rep if combined_rep is not None else attempt["reputation"],
+                attempt["match"],
+                final_success if final_success is not None else attempt["validation_raw"],
+                total_cost if total_cost is not None else attempt["cost"],
+                final_duration if final_duration is not None else attempt["durationT"],
+                ddl,
+                combined_behavior if combined_behavior is not None else attempt["behavior_record"],
+            )
+        return self._original_reward(attempt["exeT"], final_duration or attempt["durationT"], total_cost or attempt["cost"], attempt["reputation"], request_type, attempt["oracle_type"])
+
+    def _record_attempt_updates(self, policy_name, attempts):
+        for attempt in attempts:
+            if attempt is None:
+                continue
+            a = int(attempt["action"])
+            self.oracle_events[policy_name][1, a] += 1
+            self.oracle_events[policy_name][0, a] = max(self.oracle_events[policy_name][0, a], attempt["leaveT"])
+            self.oracle_events[policy_name][3, a] += attempt["match"]
+            self.oracle_events[policy_name][4, a] += attempt["validation_raw"]
+            self.reputation_factors[policy_name][0, a] += 1
+            self.reputation_factors[policy_name][1, a] += attempt["validation_raw"]
+            self.reputation_factors[policy_name][2, a] += attempt["durationT"]
+            self.reputation_factors[policy_name][3, a] += attempt["behavior_record"]
+
+    def _record_request(self, policy_name, request_id, primary, reward, success, final_duration, final_leaveT, total_cost, match, backup=None):
+        self.events[policy_name][0, request_id] = primary["action"]
+        self.events[policy_name][1, request_id] = primary["startT"]
+        self.events[policy_name][2, request_id] = primary["waitT"]
+        self.events[policy_name][3, request_id] = final_duration
+        self.events[policy_name][4, request_id] = final_leaveT
+        self.events[policy_name][5, request_id] = reward
+        self.events[policy_name][6, request_id] = primary["exeT"]
+        self.events[policy_name][7, request_id] = success
+        self.events[policy_name][8, request_id] = total_cost
+        self.events[policy_name][9, request_id] = match
+
+    def feedback(self, request_attrs, action, policy_name):
+        request_id, _, _, _, ddl = request_attrs
+        attempt = self._simulate_oracle_attempt(request_attrs, action, policy_name)
+        success = self._is_success(attempt, float(ddl))
+        reward = self._reward_for_attempt(attempt, request_attrs, final_success=success)
+        self._record_attempt_updates(policy_name, [attempt])
+        self._record_request(policy_name, int(request_id), attempt, reward, success, attempt["durationT"], attempt["leaveT"], attempt["cost"], attempt["match"])
+        # Fill minimal primary diagnostics for single-oracle policies.
+        self.pb_records[policy_name][0, int(request_id)] = success
+        self.pb_records[policy_name][4, int(request_id)] = int(action)
+        self.pb_records[policy_name][6, int(request_id)] = attempt["is_malicious"]
+        self.pb_records[policy_name][8, int(request_id)] = attempt["is_trusted"]
+        return reward
+
     def _backup_score_vector(self, request_attrs, primary_action, policy_name):
-        """Observable backup utility for PB-SafeDQN.
-
-        This score deliberately avoids privileged true validation probability.
-        It combines historical validation success, reputation, stake tokens,
-        recent load, observed abnormal behavior, cost and estimated delay.
-        Higher score means the backup is more likely to recover a failed primary
-        at acceptable cost and latency.
-        """
-        arrival_time = float(request_attrs[1])
-        length = float(request_attrs[2])
-        ddl = max(float(request_attrs[4]), 1e-8)
-
-        req_num = self.reputation_factors[policy_name][0]
-        val_num = self.reputation_factors[policy_name][1]
+        _, arrival_time, length, _, ddl = request_attrs
+        counts = self.reputation_factors[policy_name][0]
+        val = self.reputation_factors[policy_name][1]
         behavior_sum = self.reputation_factors[policy_name][3]
-
-        reputations = self.oracle_events[policy_name][2]
-        rep_norm = 0.5 * (np.tanh(reputations) + 1.0)
+        rep = np.clip(self.oracle_events[policy_name][2], 0.0, 1.0)
         token_norm = np.clip(self.oracleToken / max(float(np.max(self.oracleToken)), 1e-8), 0.0, 1.0)
-
-        # Bayesian-style cold-start smoothing: before many observations, use a
-        # weak prior from reputation and stake, not true validation probability.
-        prior = 0.5 * rep_norm + 0.5 * token_norm
+        prior = 0.5 * rep + 0.5 * token_norm
         alpha = float(getattr(self.args, "PB_Prior_Strength", 2.0))
-        recent_success = (val_num + alpha * prior) / np.maximum(req_num + alpha, 1e-8)
-
-        recent_load = req_num / max(self.timeperiodSize, 1)
+        recent_success = (val + alpha * prior) / np.maximum(counts + alpha, 1e-8)
+        recent_load = counts / max(float(self.timeperiodSize), 1.0)
         cost_norm = np.clip(self.oracleCost / max(float(np.max(self.oracleCost)), 1e-8), 0.0, 1.0)
-
-        avg_behavior = behavior_sum / np.maximum(req_num, 1.0)
-        behavior_risk = np.log1p(np.maximum(avg_behavior, 0.0)) / np.log1p(100.0)
-        behavior_risk = np.clip(behavior_risk, 0.0, 1.0)
-
-        estimated_wait = np.maximum(self.oracle_events[policy_name][0] - arrival_time, 0.0)
-        estimated_exe = length / np.maximum(self.oracleAcc, 1e-8)
-        delay_penalty = np.clip((estimated_wait + estimated_exe) / ddl, 0.0, 2.0) / 2.0
-
+        avg_behavior = behavior_sum / np.maximum(counts, 1.0)
+        behavior_risk = np.clip(np.log1p(np.maximum(avg_behavior, 0.0)) / np.log1p(100.0), 0.0, 1.0)
+        estimated_wait = np.maximum(self.oracle_events[policy_name][0] - float(arrival_time), 0.0)
+        estimated_exe = float(length) / np.maximum(self.oracleAcc, 1e-8)
+        delay_penalty = np.clip((estimated_wait + estimated_exe) / max(float(ddl), 1e-8), 0.0, 2.0) / 2.0
         score = (
             self.args.PB_W_RECENT_SUCCESS * recent_success
-            + self.args.PB_W_REPUTATION * rep_norm
+            + self.args.PB_W_REPUTATION * rep
             + self.args.PB_W_TOKEN * token_norm
             - self.args.PB_W_LOAD * recent_load
             - self.args.PB_W_COST * cost_norm
             - self.args.PB_W_BEHAVIOR_RISK * behavior_risk
             - self.args.PB_W_DELAY * delay_penalty
         )
-        # Discourage very expensive backup nodes unless their observed quality is clearly better.
-        score = score - 0.08 * (self.oracleCost > self.args.PB_Backup_Cost_Limit)
-        score = np.nan_to_num(score, nan=-1e9, posinf=1e9, neginf=-1e9)
-        return score
+        score -= 0.08 * (self.oracleCost > float(getattr(self.args, "PB_Backup_Cost_Limit", 1.05)))
+        score[int(primary_action)] = -1e9
+        return np.nan_to_num(score, nan=-1e9, posinf=1e9, neginf=-1e9)
 
     def choose_backup_oracle(self, request_attrs, primary_action, policy_name):
-        """Choose the best same-type backup oracle using observable safety score."""
-        mask = self.get_action_mask(request_attrs).astype(bool)
-        candidates = np.where(mask)[0]
-        candidates = np.array([c for c in candidates if int(c) != int(primary_action)], dtype=int)
-        if candidates.size == 0:
-            candidates = np.array([c for c in range(self.oracleNum) if int(c) != int(primary_action)], dtype=int)
-        if candidates.size == 0:
-            return int(primary_action)
-        if policy_name == "COBRA-Oracle" and getattr(self.args, "COBRA_Random_Backup", False):
+        candidates = np.where(self.get_backup_action_mask(request_attrs, primary_action))[0]
+        if policy_name in ["COBRA-Oracle", "HCRL-Oracle"] and getattr(self.args, f"{policy_name.split('-')[0]}_Random_Backup", False):
             return int(np.random.choice(candidates))
         score = self._backup_score_vector(request_attrs, primary_action, policy_name)
         return int(candidates[np.argmax(score[candidates])])
 
     def _should_use_backup(self, request_attrs, primary, backup_action, backup_score, policy_name):
-        """Decide whether a backup should be invoked.
-
-        PB-SafeDQN keeps the previous fixed/always gate. COBRA-Oracle uses an
-        adaptive utility gate: a backup is triggered only if its observable
-        utility exceeds a recent dynamic threshold and the constrained
-        cost/latency/risk terms are not obviously unfavorable.
-        """
         if int(backup_action) == int(primary["action"]):
             return False
-
-        # Serial backup cannot help when primary already consumes almost all deadline.
         if getattr(self.args, "PB_Backup_Mode", "parallel") == "serial":
-            ddl = float(request_attrs[4])
-            length = float(request_attrs[2])
-            estimated_exe = length / max(float(self.oracleAcc[backup_action]), 1e-8)
-            remaining = ddl - float(primary["durationT"])
+            remaining = float(request_attrs[4]) - float(primary["durationT"])
+            estimated_exe = float(request_attrs[2]) / max(float(self.oracleAcc[int(backup_action)]), 1e-8)
             if remaining <= 0 or estimated_exe > remaining:
                 return False
-
         if policy_name == "COBRA-Oracle":
             mode = getattr(self.args, "COBRA_Gate_Mode", "adaptive")
             if mode == "always":
                 return True
             if mode == "never":
                 return False
-
-            # Soft budget pre-screen: do not call backup if it is clearly too
-            # expensive and not very high utility. This prevents "always backup"
-            # behavior under difficult traces.
-            backup_cost = float(self.oracleCost[int(backup_action)])
-            cost_budget = float(getattr(self.args, "COBRA_Cost_Budget", 1.00))
-            if backup_cost > cost_budget * 1.35 and float(backup_score) < getattr(self.args, "COBRA_Min_Backup_Score", 0.46) + 0.08:
-                return False
-
             if mode == "fixed":
                 return float(backup_score) >= float(getattr(self.args, "COBRA_Min_Backup_Score", 0.46))
-
             hist = self.backup_score_history.get(policy_name, [])
-            window = int(getattr(self.args, "COBRA_Gate_Window", 400))
             if len(hist) >= 20:
-                recent = np.asarray(hist[-window:], dtype=float)
+                recent = np.asarray(hist[-int(getattr(self.args, "COBRA_Gate_Window", 400)):], dtype=float)
                 dyn_thr = float(np.mean(recent) + float(getattr(self.args, "COBRA_Gate_Alpha", 0.15)) * np.std(recent))
             else:
                 dyn_thr = float(getattr(self.args, "COBRA_Min_Backup_Score", 0.46))
-            threshold = max(float(getattr(self.args, "COBRA_Min_Backup_Score", 0.46)), dyn_thr)
-            return float(backup_score) >= threshold
-
-        # Existing PB-SafeDQN behavior.
+            return float(backup_score) >= max(float(getattr(self.args, "COBRA_Min_Backup_Score", 0.46)), dyn_thr)
         if getattr(self.args, "PB_Backup_Trigger", "cost_aware") == "always":
             return True
         return float(backup_score) >= float(getattr(self.args, "PB_Min_Backup_Score", 0.38))
 
-    def get_backup_action_mask(self, request_attrs, primary_action):
-        """Valid backup actions: same request type, not equal to the primary."""
-        mask = self.get_action_mask(request_attrs).astype(bool)
-        if 0 <= int(primary_action) < self.oracleNum:
-            mask[int(primary_action)] = False
-        if not np.any(mask):
-            mask = np.ones(self.oracleNum, dtype=bool)
-            if 0 <= int(primary_action) < self.oracleNum:
-                mask[int(primary_action)] = False
-        if not np.any(mask):
-            mask = np.ones(self.oracleNum, dtype=bool)
-        return mask.astype(bool)
+    def feedback_primary_backup(self, request_attrs, primary_action, policy_name="PB-SafeDQN"):
+        request_id, _, _, _, ddl = request_attrs
+        primary = self._simulate_oracle_attempt(request_attrs, primary_action, policy_name)
+        primary_success = self._is_success(primary, float(ddl))
+        backup_action = self.choose_backup_oracle(request_attrs, primary_action, policy_name)
+        score_vec = self._backup_score_vector(request_attrs, primary_action, policy_name)
+        backup_score = float(score_vec[int(backup_action)])
+        self.backup_score_history[policy_name].append(backup_score)
+        use_backup = (primary_success == 0) and self._should_use_backup(request_attrs, primary, backup_action, backup_score, policy_name)
+        backup = None
+        backup_success = 0
+        backup_recovery = 0
+        final_duration = primary["durationT"]
+        final_leaveT = primary["leaveT"]
+        total_cost = primary["cost"]
+        final_success = primary_success
+        combined_behavior = primary["behavior_record"]
+        combined_rep = primary["reputation"]
 
+        if use_backup:
+            arrival_override = primary["leaveT"] if getattr(self.args, "PB_Backup_Mode", "parallel") == "serial" else request_attrs[1]
+            backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=arrival_override)
+            backup_success = self._is_success(backup, float(ddl))
+            backup_recovery = int(primary_success == 0 and backup_success == 1)
+            final_success = int(primary_success == 1 or backup_success == 1)
+            final_duration = min(primary["durationT"] if primary_success else 1e18, backup["durationT"] if backup_success else max(primary["durationT"], backup["durationT"]))
+            if not np.isfinite(final_duration) or final_duration > 1e17:
+                final_duration = max(primary["durationT"], backup["durationT"])
+            final_leaveT = max(primary["leaveT"], backup["leaveT"])
+            total_cost += backup["cost"]
+            combined_behavior = max(primary["behavior_record"], backup["behavior_record"])
+            combined_rep = 0.5 * (primary["reputation"] + backup["reputation"])
+        backup_skipped = int(primary_success == 0 and not use_backup)
+        reward = self._reward_for_attempt(primary, request_attrs, final_success=final_success, total_cost=total_cost, final_duration=final_duration, combined_behavior=combined_behavior, combined_rep=combined_rep)
+        if policy_name == "COBRA-Oracle":
+            reward += getattr(self.args, "COBRA_Primary_Success_Bonus", 0.26) * primary_success
+            reward += getattr(self.args, "COBRA_Backup_Recovery_Bonus", 0.34) * backup_recovery
+            reward -= getattr(self.args, "COBRA_Backup_Used_Penalty", 0.22) * int(use_backup)
+            reward -= getattr(self.args, "COBRA_Backup_Skip_Penalty", 0.03) * backup_skipped
+            reward -= getattr(self.args, "COBRA_Primary_Malicious_Penalty", 0.30) * primary["is_malicious"]
+        else:
+            reward += getattr(self.args, "PB_Primary_Success_Bonus", 0.18) * primary_success
+            reward += getattr(self.args, "PB_Backup_Recovery_Bonus", 0.38) * backup_recovery
+            reward -= getattr(self.args, "PB_Backup_Used_Penalty", 0.16) * int(use_backup)
+            reward -= getattr(self.args, "PB_Backup_Skip_Penalty", 0.04) * backup_skipped
+        reward = float(np.clip(reward, -self.args.Reward_Clip, self.args.Reward_Clip))
+        self._record_attempt_updates(policy_name, [primary, backup])
+        self._record_request(policy_name, int(request_id), primary, reward, final_success, final_duration, final_leaveT, total_cost, primary["match"], backup)
+        self._record_pb_diag(policy_name, int(request_id), primary, backup, primary_success, int(use_backup), backup_success, backup_recovery, backup_skipped, backup_score, mode=-1)
+        return reward
+
+    def _record_pb_diag(self, policy_name, request_id, primary, backup, primary_success, backup_used, backup_success, backup_recovery, backup_skipped, backup_score, mode):
+        rec = self.pb_records[policy_name]
+        rec[0, request_id] = primary_success
+        rec[1, request_id] = backup_used
+        rec[2, request_id] = backup_success
+        rec[3, request_id] = backup_recovery
+        rec[4, request_id] = primary["action"]
+        rec[5, request_id] = -1 if backup is None else backup["action"]
+        rec[6, request_id] = primary["is_malicious"]
+        rec[7, request_id] = 0 if backup is None else backup["is_malicious"]
+        rec[8, request_id] = primary["is_trusted"]
+        rec[9, request_id] = 0 if backup is None else backup["is_trusted"]
+        rec[10, request_id] = backup_skipped
+        rec[11, request_id] = backup_score
+        if mode >= 0:
+            rec[12, request_id] = mode
+            rec[13, request_id] = 1 if mode == 0 else 0
+            rec[14, request_id] = 1 if mode == 1 else 0
+            rec[15, request_id] = 1 if mode == 2 else 0
+
+    # ------------------------------------------------------------------
+    # HCRL hierarchical constrained feedback
+    # ------------------------------------------------------------------
     def get_hcrl_mode_state(self, request_attrs, policy_name):
-        """High-level state for HCRL's mode policy.
-
-        It augments the ordinary oracle-selection state with budget and recent
-        policy-level diagnostics so the high-level policy can learn when to use
-        single, serial-backup, or parallel-committee recovery.
-        """
         base = self.getState(request_attrs, policy_name)
-        start = max(0, int(request_attrs[0]) - self.timeperiodSize)
-        end = max(start + 1, int(request_attrs[0]))
+        rid = int(request_attrs[0])
+        start, end = max(0, rid - self.timeperiodSize), max(1, rid)
         recent_cost = float(np.mean(self.events[policy_name][8, start:end])) if end > start else 0.0
         recent_success = float(np.mean(self.events[policy_name][7, start:end])) if end > start else 0.0
         recent_latency = float(np.mean(self.events[policy_name][3, start:end])) if end > start else 0.0
-        recent_mal = 0.0
-        if end > start:
-            primary_mal = self.pb_records[policy_name][6, start:end]
-            backup_mal = self.pb_records[policy_name][7, start:end]
-            recent_mal = float(np.mean(np.maximum(primary_mal, backup_mal)))
+        recent_mal = float(np.mean(np.maximum(self.pb_records[policy_name][6, start:end], self.pb_records[policy_name][7, start:end]))) if end > start else 0.0
         budget_state = np.array([
             recent_success,
             recent_cost / max(float(getattr(self.args, "HCRL_Cost_Budget", 1.0)), 1e-8),
@@ -508,913 +577,254 @@ class SchedulingEnv:
         ], dtype=float)
         return np.hstack((base, budget_state))
 
-    def _record_attempt_updates(self, policy_name, attempts):
-        """Update oracle/reputation records for one or more oracle attempts."""
-        for attempt in attempts:
-            if attempt is None:
-                continue
-            action = int(attempt["action"])
-            oe = self.oracle_events[policy_name]
-            oe[1, action] += 1
-            oe[0, action] = max(oe[0, action], attempt["leaveT"])
-            oe[3, action] += attempt["match"]
-            oe[4, action] += attempt["validation_raw"]
-
-            rf = self.reputation_factors[policy_name]
-            rf[0, action] += 1
-            rf[1, action] += attempt["validation_raw"]
-            rf[2, action] += attempt["durationT"]
-            rf[3, action] += attempt["behavior_record"]
-
-
     def _get_hcrl_lambdas(self, policy_name):
-        if not hasattr(self, "hcrl_lambdas"):
-            self.hcrl_lambdas = {}
         if policy_name not in self.hcrl_lambdas:
-            self.hcrl_lambdas[policy_name] = {
-                "cost": float(getattr(self.args, "HCRL_Lambda_Cost", 0.55)),
-                "latency": float(getattr(self.args, "HCRL_Lambda_Latency", 0.40)),
-                "risk": float(getattr(self.args, "HCRL_Lambda_Risk", 0.80)),
-            }
+            self.hcrl_lambdas[policy_name] = {"cost": self.args.HCRL_Lambda_Cost, "latency": self.args.HCRL_Lambda_Latency, "risk": self.args.HCRL_Lambda_Risk}
         return self.hcrl_lambdas[policy_name]
 
     def _update_hcrl_lambdas(self, policy_name, cost_violation, latency_violation, risk_violation):
-        """Primal-dual update for HCRL cost/latency/risk multipliers."""
-        if getattr(self.args, "HCRL_No_Constrained", False) or not getattr(self.args, "HCRL_Primal_Dual", True):
-            return self._get_hcrl_lambdas(policy_name)
         lambdas = self._get_hcrl_lambdas(policy_name)
+        if getattr(self.args, "HCRL_No_Constrained", False) or not getattr(self.args, "HCRL_Primal_Dual", True):
+            return lambdas
         lr = float(getattr(self.args, "HCRL_Lambda_LR", 0.01))
-        lo = float(getattr(self.args, "HCRL_Lambda_Min", 0.0))
-        hi = float(getattr(self.args, "HCRL_Lambda_Max", 3.0))
-        lambdas["cost"] = float(np.clip(lambdas["cost"] + lr * float(cost_violation), lo, hi))
-        lambdas["latency"] = float(np.clip(lambdas["latency"] + lr * float(latency_violation), lo, hi))
-        lambdas["risk"] = float(np.clip(lambdas["risk"] + lr * float(risk_violation), lo, hi))
+        lo, hi = float(getattr(self.args, "HCRL_Lambda_Min", 0.0)), float(getattr(self.args, "HCRL_Lambda_Max", 3.0))
+        lambdas["cost"] = float(np.clip(lambdas["cost"] + lr * cost_violation, lo, hi))
+        lambdas["latency"] = float(np.clip(lambdas["latency"] + lr * latency_violation, lo, hi))
+        lambdas["risk"] = float(np.clip(lambdas["risk"] + lr * risk_violation, lo, hi))
         return lambdas
 
     def feedback_hcrl(self, request_attrs, mode_action, primary_action, backup_action, policy_name="HCRL-Oracle"):
-        """Hierarchical Constrained RL feedback.
-
-        HCRL learns a high-level recovery mode and two low-level selectors:
-        mode 0 = single oracle, mode 1 = serial backup after primary failure,
-        mode 2 = parallel warm-standby committee.  Unlike COBRA's heuristic
-        backup gate, the backup oracle is selected by a learned backup Q-policy
-        and the high-level mode is also learned.  The environment returns
-        separate rewards for mode, primary, and backup policies, enabling
-        counterfactual-style credit assignment.
-        """
-        if policy_name not in self.policy_names:
-            raise ValueError(f"Unknown policy_name: {policy_name}")
-        request_id, arrival_time, length, request_type, ddl = request_attrs
+        request_id, arrival_time, length, _, ddl = request_attrs
         request_id = int(request_id)
-        ddl = float(ddl)
         mode_action = int(np.clip(mode_action, 0, 2))
-        primary_action = int(primary_action)
-        backup_action = int(backup_action) if int(backup_action) >= 0 else -1
-
         primary = self._simulate_oracle_attempt(request_attrs, primary_action, policy_name)
-        primary_success = 1 if (primary["durationT"] <= ddl and primary["match"] == 1 and primary["validation_raw"] == 1) else 0
-
+        primary_success = self._is_success(primary, float(ddl))
+        backup = None
         backup_used = 0
         backup_success = 0
         backup_recovery = 0
         backup_skipped = 0
-        backup = None
         backup_score = 0.0
+        final_success = primary_success
         final_duration = primary["durationT"]
         final_leaveT = primary["leaveT"]
-        effective_total_cost = primary["cost"]
-        accounting_total_cost = primary["cost"]
-        final_success = primary_success
+        total_cost = primary["cost"]
+        accounting_cost = primary["cost"]
         combined_behavior = primary["behavior_record"]
         combined_rep = primary["reputation"]
 
         if backup_action >= 0 and backup_action != primary_action:
-            score_vec = self._backup_score_vector(request_attrs, primary_action, policy_name)
-            backup_score = float(score_vec[backup_action])
+            backup_score = float(self._backup_score_vector(request_attrs, primary_action, policy_name)[int(backup_action)])
 
-        # Mode 1: serial recovery only after primary failure.
         if mode_action == 1 and primary_success == 0 and backup_action >= 0 and backup_action != primary_action:
-            # Serial backup must still fit within the remaining deadline.
-            estimated_exe = float(length) / max(float(self.oracleAcc[backup_action]), 1e-8)
-            remaining = ddl - float(primary["durationT"])
-            if remaining > 0 and estimated_exe <= remaining:
-                backup_used = 1
-                backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=primary["leaveT"])
-                final_duration = primary["durationT"] + backup["durationT"]
-                final_leaveT = backup["leaveT"]
-                accounting_total_cost += backup["cost"]
-                effective_total_cost += backup["cost"]
-                combined_behavior = max(float(primary["behavior_record"]), float(backup["behavior_record"]))
-                combined_rep = 0.5 * (float(primary["reputation"]) + float(backup["reputation"]))
-                backup_success = 1 if (final_duration <= ddl and backup["match"] == 1 and backup["validation_raw"] == 1) else 0
-                backup_recovery = 1 if backup_success == 1 else 0
-                final_success = 1 if backup_recovery else 0
-            else:
-                backup_skipped = 1
-        elif mode_action == 1 and primary_success == 0:
-            backup_skipped = 1
-
-        # Mode 2: parallel warm-standby committee. The backup is queried in
-        # parallel; it can recover if the primary fails, while a discount models
-        # shared request/gas overhead in a committee-style call.
-        if mode_action == 2 and backup_action >= 0 and backup_action != primary_action:
+            # Serial backup starts after the primary result and must still be useful under the deadline.
+            arrival_override = primary["leaveT"]
+            backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=arrival_override)
             backup_used = 1
+        elif mode_action == 2 and backup_action >= 0 and backup_action != primary_action:
+            # Parallel warm-standby committee is launched at the same arrival time.
             backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=arrival_time)
-            final_duration = max(primary["durationT"], backup["durationT"])
-            final_leaveT = float(arrival_time) + final_duration
-            discount = float(getattr(self.args, "HCRL_Parallel_Cost_Discount", 0.85))
-            accounting_total_cost += backup["cost"]
-            effective_total_cost += discount * backup["cost"]
-            combined_behavior = max(float(primary["behavior_record"]), float(backup["behavior_record"]))
-            combined_rep = 0.5 * (float(primary["reputation"]) + float(backup["reputation"]))
-            backup_success = 1 if (final_duration <= ddl and backup["match"] == 1 and backup["validation_raw"] == 1) else 0
-            backup_recovery = 1 if (primary_success == 0 and backup_success == 1) else 0
-            final_success = 1 if (primary_success == 1 or backup_success == 1) else 0
+            backup_used = 1
 
-        final_match = primary["match"] if primary_success else (backup["match"] if backup is not None else primary["match"])
-        final_reward = self._risk_aware_reward(
-            combined_rep,
-            final_match,
-            final_success,
-            effective_total_cost,
-            final_duration,
-            ddl,
-            combined_behavior,
+        if backup is not None:
+            backup_success = self._is_success(backup, float(ddl))
+            backup_recovery = int(primary_success == 0 and backup_success == 1)
+            final_success = int(primary_success == 1 or backup_success == 1)
+            if primary_success and backup_success:
+                final_duration = min(primary["durationT"], backup["durationT"])
+            elif backup_success:
+                final_duration = backup["durationT"]
+            else:
+                final_duration = max(primary["durationT"], backup["durationT"])
+            final_leaveT = max(primary["leaveT"], backup["leaveT"])
+            accounting_cost = primary["cost"] + backup["cost"]
+            if mode_action == 2:
+                total_cost = primary["cost"] + float(getattr(self.args, "HCRL_Parallel_Cost_Discount", 0.85)) * backup["cost"]
+            else:
+                total_cost = accounting_cost
+            combined_behavior = max(primary["behavior_record"], backup["behavior_record"])
+            combined_rep = 0.5 * (primary["reputation"] + backup["reputation"])
+        else:
+            backup_skipped = int(primary_success == 0 and mode_action == 0)
+
+        risk = float(max(primary["is_malicious"], 0 if backup is None else backup["is_malicious"]))
+        cost_violation = max(0.0, total_cost - float(getattr(self.args, "HCRL_Cost_Budget", 1.02)))
+        latency_violation = max(0.0, final_duration - float(getattr(self.args, "HCRL_Latency_Budget", 5.95)))
+        risk_violation = max(0.0, risk - float(getattr(self.args, "HCRL_Risk_Budget", 0.06)))
+        lambdas = self._update_hcrl_lambdas(policy_name, cost_violation, latency_violation, risk_violation)
+
+        base_reward = self._reward_for_attempt(primary, request_attrs, final_success=final_success, total_cost=total_cost, final_duration=final_duration, combined_behavior=combined_behavior, combined_rep=combined_rep)
+        constraint_penalty = 0.0 if getattr(self.args, "HCRL_No_Constrained", False) else (
+            lambdas["cost"] * cost_violation + lambdas["latency"] * latency_violation + lambdas["risk"] * risk_violation
         )
-
-        primary_mal = float(primary["is_malicious"])
-        backup_mal = float(backup["is_malicious"]) if backup is not None else 0.0
-        risk_indicator = max(primary_mal, backup_mal)
-        cost_violation = max(0.0, float(effective_total_cost) - float(getattr(self.args, "HCRL_Cost_Budget", 1.02)))
-        latency_violation = max(0.0, float(final_duration) - float(getattr(self.args, "HCRL_Latency_Budget", 5.95))) / max(ddl, 1e-8)
-        risk_violation = max(0.0, risk_indicator - float(getattr(self.args, "HCRL_Risk_Budget", 0.06)))
-        constraint_violation = 1.0 if (cost_violation > 0 or latency_violation > 0 or risk_violation > 0) else 0.0
-
-        lambda_state = self._get_hcrl_lambdas(policy_name)
-        if not getattr(self.args, "HCRL_No_Constrained", False):
-            final_reward -= float(lambda_state["cost"]) * cost_violation
-            final_reward -= float(lambda_state["latency"]) * latency_violation
-            final_reward -= float(lambda_state["risk"]) * risk_violation
-
-        # Mode policy reward: final system utility minus mode-specific overhead.
-        mode_reward = final_reward
-        mode_reward += float(getattr(self.args, "HCRL_Primary_Success_Bonus", 0.30)) * primary_success
-        mode_reward += float(getattr(self.args, "HCRL_Backup_Recovery_Bonus", 0.40)) * backup_recovery
-        mode_reward -= float(getattr(self.args, "HCRL_Backup_Used_Penalty", 0.20)) * backup_used
-        if backup_used == 1 and primary_success == 1:
-            mode_reward -= float(getattr(self.args, "HCRL_Unnecessary_Backup_Penalty", 0.32))
-        if mode_action == 0 and primary_success == 0:
-            mode_reward -= float(getattr(self.args, "HCRL_Skip_Recovery_Penalty", 0.08))
-
-        primary_reward = self._risk_aware_reward(
-            primary["reputation"], primary["match"], primary_success,
-            primary["cost"], primary["durationT"], ddl, primary["behavior_record"],
-        )
-        primary_reward += float(getattr(self.args, "HCRL_Primary_Success_Bonus", 0.30)) * primary_success
-        primary_reward -= float(getattr(self.args, "HCRL_Primary_Malicious_Penalty", 0.35)) * primary_mal
-        primary_reward -= 0.10 * (1.0 - primary_success)
-
-        backup_reward = 0.0
-        if backup_used == 1 and backup is not None:
-            backup_reward = self._risk_aware_reward(
-                backup["reputation"], backup["match"], backup_success,
-                backup["cost"], backup["durationT"], ddl, backup["behavior_record"],
-            )
-            backup_reward += float(getattr(self.args, "HCRL_Backup_Recovery_Bonus", 0.40)) * backup_recovery
-            backup_reward -= float(getattr(self.args, "HCRL_Backup_Used_Penalty", 0.20))
-            backup_reward -= float(getattr(self.args, "HCRL_Backup_Malicious_Penalty", 0.50)) * backup_mal
-            if primary_success == 1:
-                backup_reward -= float(getattr(self.args, "HCRL_Unnecessary_Backup_Penalty", 0.32))
-        elif mode_action in [1, 2] and primary_success == 0:
-            backup_reward -= float(getattr(self.args, "HCRL_Skip_Recovery_Penalty", 0.08))
+        reward = base_reward - constraint_penalty
+        reward += getattr(self.args, "HCRL_Primary_Success_Bonus", 0.30) * primary_success
+        reward += getattr(self.args, "HCRL_Backup_Recovery_Bonus", 0.40) * backup_recovery
+        reward -= getattr(self.args, "HCRL_Backup_Used_Penalty", 0.20) * backup_used
+        reward -= getattr(self.args, "HCRL_Unnecessary_Backup_Penalty", 0.32) * int(backup_used and primary_success)
+        reward -= getattr(self.args, "HCRL_Skip_Recovery_Penalty", 0.08) * backup_skipped
+        reward -= getattr(self.args, "HCRL_Primary_Malicious_Penalty", 0.35) * primary["is_malicious"]
+        if backup is not None:
+            reward -= getattr(self.args, "HCRL_Backup_Malicious_Penalty", 0.50) * backup["is_malicious"]
+        reward = float(np.clip(reward, -self.args.Reward_Clip, self.args.Reward_Clip))
 
         if getattr(self.args, "HCRL_No_Decoupled_Reward", False):
-            primary_reward = final_reward
-            backup_reward = final_reward
-            mode_reward = final_reward
-
-        final_reward = float(np.clip(final_reward, -self.args.Reward_Clip, self.args.Reward_Clip))
-        primary_reward = float(np.clip(primary_reward, -self.args.Reward_Clip, self.args.Reward_Clip))
-        backup_reward = float(np.clip(backup_reward, -self.args.Reward_Clip, self.args.Reward_Clip))
-        mode_reward = float(np.clip(mode_reward, -self.args.Reward_Clip, self.args.Reward_Clip))
-
-        ev = self.events[policy_name]
-        ev[0, request_id] = primary["action"]
-        ev[1, request_id] = primary["startT"]
-        ev[2, request_id] = primary["waitT"]
-        ev[3, request_id] = final_duration
-        ev[4, request_id] = final_leaveT
-        ev[5, request_id] = final_reward
-        ev[6, request_id] = primary["exeT"]
-        ev[7, request_id] = final_success
-        ev[8, request_id] = effective_total_cost
-        ev[9, request_id] = 1 if final_duration <= ddl else 0
-
-        self._record_attempt_updates(policy_name, [primary, backup] if backup is not None else [primary])
-
-        pb = self.pb_records[policy_name]
-        pb[0, request_id] = primary_success
-        pb[1, request_id] = backup_used
-        pb[2, request_id] = backup_success
-        pb[3, request_id] = backup_recovery
-        pb[4, request_id] = primary["action"]
-        pb[5, request_id] = backup_action
-        pb[6, request_id] = primary["is_malicious"]
-        pb[7, request_id] = backup["is_malicious"] if backup is not None else 0
-        pb[8, request_id] = primary["is_trusted"]
-        pb[9, request_id] = backup["is_trusted"] if backup is not None else 0
-        pb[10, request_id] = backup_skipped
-        pb[11, request_id] = backup_score
-        pb[12, request_id] = mode_action
-        pb[13, request_id] = 1 if mode_action == 0 else 0
-        pb[14, request_id] = 1 if mode_action == 1 else 0
-        pb[15, request_id] = 1 if mode_action == 2 else 0
-        pb[16, request_id] = constraint_violation
-        pb[17, request_id] = cost_violation
-        pb[18, request_id] = latency_violation
-        pb[19, request_id] = risk_violation
-        # Dynamic primal-dual lambda update is performed after recording the
-        # transition so the next decision observes the updated budget pressure.
-        lambda_state = self._update_hcrl_lambdas(policy_name, cost_violation, latency_violation, risk_violation)
-        pb[20, request_id] = lambda_state["cost"]
-        pb[21, request_id] = lambda_state["latency"]
-        pb[22, request_id] = lambda_state["risk"]
-        if primary_success == 0 and backup_action >= 0:
-            self.backup_score_history.setdefault(policy_name, []).append(float(backup_score))
-
-        return {
-            "final_reward": final_reward,
-            "mode_reward": mode_reward,
-            "primary_reward": primary_reward,
-            "backup_reward": backup_reward,
-            "backup_used": backup_used,
-            "mode_action": mode_action,
-            "primary_success": primary_success,
-            "backup_recovery": backup_recovery,
-        }
-
-    def feedback_primary_backup(self, request_attrs, primary_action, policy_name="PB-SafeDQN"):
-        """Primary-backup failover feedback for PB-SafeDQN.
-
-        A Dueling Double DQN selects the primary oracle. If the primary attempt
-        fails validation-aware success, a backup oracle is selected by an
-        observable reputation-load-cost safety rule. In parallel mode, the
-        backup represents a warm-standby oracle whose response can recover the
-        request without serially doubling the latency. In serial mode, the
-        backup starts after the primary attempt. The final event records the
-        combined request outcome and cost.
-        """
-        if policy_name not in self.policy_names:
-            raise ValueError(f"Unknown policy_name: {policy_name}")
-        request_id, arrival_time, length, request_type, ddl = request_attrs
-        request_id = int(request_id)
-        ddl = float(ddl)
-
-        primary = self._simulate_oracle_attempt(request_attrs, primary_action, policy_name)
-        primary_success = 1 if (primary["durationT"] <= ddl and primary["match"] == 1 and primary["validation_raw"] == 1) else 0
-
-        backup_used = 0
-        backup_success = 0
-        backup_recovery = 0
-        backup_skipped = 0
-        backup = None
-        backup_action = -1
-        backup_score = 0.0
-        final_duration = primary["durationT"]
-        final_leaveT = primary["leaveT"]
-        total_cost = primary["cost"]
-        final_success = primary_success
-        combined_behavior = primary["behavior_record"]
-        combined_rep = primary["reputation"]
-
-        if primary_success == 0:
-            backup_action = self.choose_backup_oracle(request_attrs, primary["action"], policy_name)
-            backup_scores = self._backup_score_vector(request_attrs, primary["action"], policy_name)
-            backup_score = float(backup_scores[int(backup_action)])
-            if self._should_use_backup(request_attrs, primary, backup_action, backup_score, policy_name):
-                backup_used = 1
-                if getattr(self.args, "PB_Backup_Mode", "parallel") == "serial":
-                    backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=primary["leaveT"])
-                    final_duration = primary["durationT"] + backup["durationT"]
-                    final_leaveT = backup["leaveT"]
-                else:
-                    backup = self._simulate_oracle_attempt(request_attrs, backup_action, policy_name, arrival_override=arrival_time)
-                    final_duration = max(primary["durationT"], backup["durationT"])
-                    final_leaveT = float(arrival_time) + final_duration
-                total_cost += backup["cost"]
-                combined_behavior = max(float(primary["behavior_record"]), float(backup["behavior_record"]))
-                combined_rep = 0.5 * (float(primary["reputation"]) + float(backup["reputation"]))
-                backup_success = 1 if (final_duration <= ddl and backup["match"] == 1 and backup["validation_raw"] == 1) else 0
-                backup_recovery = 1 if backup_success == 1 else 0
-                final_success = 1 if backup_success == 1 else 0
-            else:
-                backup_skipped = 1
-
-        # The final request is type-matched if the successful route was matched;
-        # with type action masking this should be true, but keep it explicit.
-        final_match = primary["match"] if primary_success else (backup["match"] if backup is not None else primary["match"])
-        # Final system-level reward stored in events. For COBRA, this is a
-        # constrained reliability-cost objective. The reward returned to the
-        # primary Q-network can be decoupled below so backup recovery does not
-        # hide primary mistakes.
-        final_reward = self._risk_aware_reward(
-            combined_rep,
-            final_match,
-            final_success,
-            total_cost,
-            final_duration,
-            ddl,
-            combined_behavior,
-        )
-
-        if policy_name == "COBRA-Oracle":
-            final_reward += self.args.COBRA_Primary_Success_Bonus * primary_success
-            final_reward += self.args.COBRA_Backup_Recovery_Bonus * backup_recovery
-            final_reward -= self.args.COBRA_Backup_Used_Penalty * backup_used
-            final_reward -= self.args.COBRA_Backup_Skip_Penalty * backup_skipped
-
-            # Soft Lagrangian-style constraints: penalize excessive recovery
-            # overhead so COBRA cannot win by simply calling more oracles.
-            cost_violation = max(0.0, float(total_cost) - float(self.args.COBRA_Cost_Budget))
-            latency_violation = max(0.0, float(final_duration) - float(self.args.COBRA_Latency_Budget)) / max(float(ddl), 1e-8)
-            risk_indicator = max(float(primary["is_malicious"]), float(backup["is_malicious"]) if backup is not None else 0.0)
-            risk_violation = max(0.0, risk_indicator - float(self.args.COBRA_Risk_Budget))
-            final_reward -= self.args.COBRA_Lambda_Cost * cost_violation
-            final_reward -= self.args.COBRA_Lambda_Latency * latency_violation
-            final_reward -= self.args.COBRA_Lambda_Risk * risk_violation
-
-            primary_train_reward = self._risk_aware_reward(
-                primary["reputation"],
-                primary["match"],
-                primary_success,
-                primary["cost"],
-                primary["durationT"],
-                ddl,
-                primary["behavior_record"],
-            )
-            primary_train_reward += self.args.COBRA_Primary_Success_Bonus * primary_success
-            primary_train_reward -= self.args.COBRA_Primary_Malicious_Penalty * primary["is_malicious"]
-            primary_train_reward -= 0.12 * (1.0 - primary_success)
-            train_reward = final_reward if getattr(self.args, "COBRA_No_Decoupled_Reward", False) else primary_train_reward
+            mode_reward = primary_reward = backup_reward = reward
         else:
-            final_reward += self.args.PB_Primary_Success_Bonus * primary_success
-            final_reward += self.args.PB_Backup_Recovery_Bonus * backup_recovery
-            final_reward -= self.args.PB_Backup_Used_Penalty * backup_used
-            final_reward -= self.args.PB_Backup_Skip_Penalty * backup_skipped
-            train_reward = final_reward
+            mode_reward = float(np.clip(reward + 0.25 * final_success - 0.15 * (cost_violation + latency_violation + risk_violation), -self.args.Reward_Clip, self.args.Reward_Clip))
+            primary_reward = float(np.clip(base_reward + getattr(self.args, "HCRL_Primary_Success_Bonus", 0.30) * primary_success - getattr(self.args, "HCRL_Primary_Malicious_Penalty", 0.35) * primary["is_malicious"], -self.args.Reward_Clip, self.args.Reward_Clip))
+            backup_reward = float(np.clip(getattr(self.args, "HCRL_Backup_Recovery_Bonus", 0.40) * backup_recovery - getattr(self.args, "HCRL_Backup_Used_Penalty", 0.20) * backup_used - (0 if backup is None else getattr(self.args, "HCRL_Backup_Malicious_Penalty", 0.50) * backup["is_malicious"]), -self.args.Reward_Clip, self.args.Reward_Clip))
 
-        reward = float(np.clip(final_reward, -self.args.Reward_Clip, self.args.Reward_Clip))
-        train_reward = float(np.clip(train_reward, -self.args.Reward_Clip, self.args.Reward_Clip))
+        self._record_attempt_updates(policy_name, [primary, backup])
+        self._record_request(policy_name, request_id, primary, reward, final_success, final_duration, final_leaveT, total_cost, primary["match"], backup)
+        self._record_pb_diag(policy_name, request_id, primary, backup, primary_success, backup_used, backup_success, backup_recovery, backup_skipped, backup_score, mode_action)
+        rec = self.pb_records[policy_name]
+        rec[16, request_id] = 1 if (cost_violation + latency_violation + risk_violation) > 0 else 0
+        rec[17, request_id] = cost_violation
+        rec[18, request_id] = latency_violation
+        rec[19, request_id] = risk_violation
+        rec[20, request_id] = lambdas["cost"]
+        rec[21, request_id] = lambdas["latency"]
+        rec[22, request_id] = lambdas["risk"]
+        return {"final_reward": reward, "mode_reward": mode_reward, "primary_reward": primary_reward, "backup_reward": backup_reward}
 
-        # Write final combined request event.
-        ev = self.events[policy_name]
-        ev[0, request_id] = primary["action"]
-        ev[1, request_id] = primary["startT"]
-        ev[2, request_id] = primary["waitT"]
-        ev[3, request_id] = final_duration
-        ev[4, request_id] = final_leaveT
-        ev[5, request_id] = reward
-        ev[6, request_id] = primary["exeT"]
-        ev[7, request_id] = final_success
-        ev[8, request_id] = total_cost
-        ev[9, request_id] = 1 if final_duration <= ddl else 0
-
-        # Update primary oracle records.
-        for attempt in [primary, backup] if backup is not None else [primary]:
-            action = int(attempt["action"])
-            oe = self.oracle_events[policy_name]
-            oe[1, action] += 1
-            oe[0, action] = max(oe[0, action], attempt["leaveT"])
-            oe[3, action] += attempt["match"]
-            # Count raw validation successes for reputation, not final request success.
-            oe[4, action] += attempt["validation_raw"]
-
-            rf = self.reputation_factors[policy_name]
-            rf[0, action] += 1
-            rf[1, action] += attempt["validation_raw"]
-            rf[2, action] += attempt["durationT"]
-            rf[3, action] += attempt["behavior_record"]
-
-        pb = self.pb_records[policy_name]
-        pb[0, request_id] = primary_success
-        pb[1, request_id] = backup_used
-        pb[2, request_id] = backup_success
-        pb[3, request_id] = backup_recovery
-        pb[4, request_id] = primary["action"]
-        pb[5, request_id] = backup_action
-        pb[6, request_id] = primary["is_malicious"]
-        pb[7, request_id] = backup["is_malicious"] if backup is not None else 0
-        pb[8, request_id] = primary["is_trusted"]
-        pb[9, request_id] = backup["is_trusted"] if backup is not None else 0
-        pb[10, request_id] = backup_skipped
-        pb[11, request_id] = backup_score
-        if primary_success == 0:
-            self.backup_score_history.setdefault(policy_name, []).append(float(backup_score))
-
-        return train_reward
-
-    def feedback(self, request_attrs, action, policy_name):
-        if policy_name not in self.policy_names:
-            raise ValueError(f"Unknown policy_name: {policy_name}")
-        if action < 0 or action >= self.oracleNum:
-            raise IndexError(f"action {action} out of bounds for {self.oracleNum} oracles")
-
-        request_id, arrival_time, length, request_type, ddl = request_attrs
-        request_id = int(request_id)
-        request_type = int(request_type)
-        action = int(action)
-
-        acc = self.oracleAcc[action]
-        cost = self.oracleCost[action]
-        oracle_type = int(self.oracleTypes[action])
-        validation_prob = self._effective_validation_prob(action, policy_name)
-        behavior_probs = self.oracleBehaviorProbs[action]
-
-        idleT = self.oracle_events[policy_name][0, action]
-        reputation = self.oracle_events[policy_name][2, action]
-
-        exeT = length / acc
-        if idleT <= arrival_time:
-            waitT = 0.0
-            startT = arrival_time
-        else:
-            waitT = idleT - arrival_time
-            startT = idleT
-
-        if action in self.malicious_oracles:
-            exe_time = (length * 1.05) / acc
-        else:
-            exe_time = exeT
-
-        if np.random.rand() < self.noise_probability:
-            real_exeT = exe_time + self.noise_delay
-        else:
-            real_exeT = exe_time
-
-        durationT = waitT + real_exeT
-        leaveT = startT + real_exeT
-        new_idleT = leaveT
-
-        match = 1 if request_type == oracle_type else 0
-        success_without_type = 1 if durationT <= ddl else 0
-        successful_validation = 1 if np.random.rand() < validation_prob and durationT <= ddl else 0
-        if self.args.Success_Mode == "validation_aware":
-            success = 1 if durationT <= ddl and match == 1 and successful_validation == 1 else 0
-        else:
-            success = 1 if durationT <= ddl and match == 1 else 0
-        behavior_record = np.random.choice([0, 1, 5, 100], p=behavior_probs)
-
-        original_reward = self._original_reward(exeT, durationT, cost, reputation, request_type, oracle_type)
-        if self.args.Reward_Mode == "risk_aware" or policy_name == "RA-DDQN":
-            reward = self._risk_aware_reward(reputation, match, successful_validation, cost, durationT, ddl, behavior_record)
-        else:
-            reward = original_reward
-
-        ev = self.events[policy_name]
-        ev[0, request_id] = action
-        ev[1, request_id] = startT
-        ev[2, request_id] = waitT
-        ev[3, request_id] = durationT
-        ev[4, request_id] = leaveT
-        ev[5, request_id] = reward
-        ev[6, request_id] = exeT
-        ev[7, request_id] = success
-        ev[8, request_id] = cost
-        ev[9, request_id] = success_without_type
-
-        oe = self.oracle_events[policy_name]
-        oe[1, action] += 1
-        oe[0, action] = new_idleT
-        oe[3, action] += match
-        oe[4, action] += successful_validation
-
-        rf = self.reputation_factors[policy_name]
-        rf[0, action] += 1
-        rf[1, action] += successful_validation
-        rf[2, action] += durationT
-        rf[3, action] += behavior_record
-
-        return reward
-
-    def feedback_PSG_FWA(self, request_attrs, policy_name="SemiGreedy"):
-        arrival_time = request_attrs[1]
-        length = request_attrs[2]
-        request_type = int(request_attrs[3])
-        rewards = np.zeros(self.oracleNum)
-        idleT = self.oracle_events[policy_name][0]
-        reputation = self.oracle_events[policy_name][2]
-
-        for action in range(self.oracleNum):
-            waitT = max(idleT[action] - arrival_time, 0)
-            exeT = length / self.oracleAcc[action]
-            if action in self.malicious_oracles:
-                exe_time = (length * 1.05) / self.oracleAcc[action]
-            else:
-                exe_time = exeT
-            durationT = waitT + exe_time
-            oracle_type = int(self.oracleTypes[action])
-            if self.args.SemiGreedy_View == "risk_aware":
-                # Expected one-step risk-aware score. This gives SemiGreedy access to
-                # validation statistics; the default myopic view intentionally does not.
-                match = 1 if request_type == oracle_type else 0
-                expected_validation = self._effective_validation_prob(action, policy_name) if durationT <= request_attrs[4] else 0.0
-                expected_behavior = float(np.dot(self.oracleBehaviorProbs[action], np.array([0, 1, 5, 100], dtype=float)))
-                rewards[action] = self._risk_aware_reward(
-                    reputation[action], match, expected_validation, self.oracleCost[action], durationT, request_attrs[4], expected_behavior
-                )
-            else:
-                rewards[action] = self._original_reward(
-                    exeT, durationT, self.oracleCost[action], reputation[action], request_type, oracle_type
-                )
-        return rewards, self.oracleCost
-
-    def get_reputation_factors(self, policy_name):
-        total_requests = self.reputation_factors[policy_name][0]
-        successful_validation_requests = self.reputation_factors[policy_name][1]
-        total_response_time = self.reputation_factors[policy_name][2]
-        behavior_records = self.reputation_factors[policy_name][3]
-
-        success_rate = np.zeros(self.oracleNum)
-        average_response_time = np.zeros(self.oracleNum)
-        response_time_score = np.zeros(self.oracleNum)
-
-        average_requests = self.timeperiodSize / max(self.oracleNum, 1)
-        relative_response_frequency = total_requests / average_requests if average_requests > 0 else 0
-        for i in range(self.oracleNum):
-            success_rate[i] = successful_validation_requests[i] / total_requests[i] if total_requests[i] > 0 else 0
-            average_response_time[i] = total_response_time[i] / total_requests[i] if total_requests[i] > 0 else 0
-            response_time_score[i] = self.ddl / average_response_time[i] if average_response_time[i] > 0 else 0
-        reliability_score = (relative_response_frequency * 0.2) + (success_rate * 0.4) + (response_time_score * 0.4)
-        behavior_score = behavior_records
-        avg_tokens = max(float(np.mean(self.oracleToken)), 1e-8)
-        staked_tokens_score = self.oracleToken / avg_tokens
-        return [reliability_score, behavior_score, staked_tokens_score]
-
-    def initial_reputation(self):
-        for name in self.policy_names:
-            self.oracle_reputation_history[name][0] = self.oracleInitialReputation
-            self.reputation_timewindow[name] = np.append(
-                self.reputation_timewindow[name], [self.oracle_reputation_history[name][0]], axis=0
-            )
-            self.oracle_events[name][2] = self.oracleInitialReputation
-
-    def update_reputation(self, reputation_attributes, current_period, policy_name):
-        reliability_score, behavior_score, staked_tokens_score = reputation_attributes
-        base_reputation = (reliability_score * 0.4) - (behavior_score * 0.4) + (staked_tokens_score * 0.2)
-        reputation = np.zeros(self.oracleNum)
-
-        if current_period <= 1 or current_period > self.timeperiodNum:
-            return
-
-        tw = self.reputation_timewindow[policy_name]
-        for idx in range(tw.shape[0]):
-            k = idx + 2
-            time_factor = np.tanh(0.6 / k)
-            reputation += time_factor * tw[idx]
-        reputation += base_reputation * np.tanh(0.6 / 1)
-
-        self.oracle_reputation_history[policy_name][current_period - 1] = reputation
-        self.oracle_events[policy_name][2] = reputation
-
-        new_reputation = np.array(reputation).reshape(1, -1)
-        if self.reputation_timewindow[policy_name].shape[0] < self.timewindowSize:
-            self.reputation_timewindow[policy_name] = np.vstack((new_reputation, self.reputation_timewindow[policy_name]))
-        else:
-            self.reputation_timewindow[policy_name] = np.vstack((new_reputation, self.reputation_timewindow[policy_name][:-1, :]))
-
+    # ------------------------------------------------------------------
+    # Heuristic support
+    # ------------------------------------------------------------------
     def get_oracle_idleT(self, policy_name):
-        return self.oracle_events[policy_name][0, :]
-
-    def get_oracle_reputation(self, policy_name):
-        return self.oracle_events[policy_name][2, :]
-
-    def get_successful_validation(self, policy_name):
-        return np.array(self.reputation_factors[policy_name][1, :])
+        return self.oracle_events[policy_name][0]
 
     def get_request_num(self, policy_name):
-        return np.array(self.reputation_factors[policy_name][0, :])
+        return self.oracle_events[policy_name][1]
 
+    def get_successful_validation(self, policy_name):
+        return self.oracle_events[policy_name][4]
 
-    def _build_oracle_feature_matrix(self, request_attrs, policy_name):
-        """Return normalized per-oracle node features used by the graph encoder.
+    def feedback_PSG_FWA(self, request_attrs, policy_name):
+        rewards = np.zeros(self.oracleNum, dtype=float)
+        costs = np.asarray(self.oracleCost, dtype=float).copy()
+        for a in range(self.oracleNum):
+            # Deterministic one-step estimate without mutating environment.
+            wait = max(self.oracle_events[policy_name][0, a] - float(request_attrs[1]), 0.0)
+            exe = float(request_attrs[2]) / max(self.oracleAcc[a], 1e-8)
+            duration = wait + exe
+            match = 1 if self.oracleTypes[a] == int(request_attrs[3]) else 0
+            if getattr(self.args, "SemiGreedy_View", "myopic") == "risk_aware":
+                rep = self.oracle_events[policy_name][2, a]
+                val_est = self._effective_validation_prob(a, policy_name)
+                rewards[a] = self._risk_aware_reward(rep, match, val_est, self.oracleCost[a], duration, request_attrs[4], 0.0)
+            else:
+                rewards[a] = self._original_reward(exe, duration, self.oracleCost[a], self.oracle_events[policy_name][2, a], request_attrs[3], self.oracleTypes[a])
+        return rewards, costs
 
-        The raw enhanced state stores oracle features by feature group.  The GNN
-        encoder instead treats each oracle as a node and aggregates information
-        from dynamically related oracle nodes.  The output keeps 8 dimensions per
-        oracle so it can replace the flat oracle feature block without changing
-        downstream model input size.
-        """
-        arrivalT = float(request_attrs[1])
-        length = float(request_attrs[2])
-        request_service = int(request_attrs[3])
-        idleTimes = self.get_oracle_idleT(policy_name)
-        reputations = self.get_oracle_reputation(policy_name)
-        waitTimes = np.maximum(idleTimes - arrivalT, 0.0)
-        type_match = np.array([1.0 if request_service == int(t) else 0.0 for t in self.oracleTypes])
-        req_num = self.reputation_factors[policy_name][0]
-        val_num = self.reputation_factors[policy_name][1]
-        recent_success_rate = np.divide(val_num, np.maximum(req_num, 1.0), dtype=float)
-        recent_load = req_num / max(self.timeperiodSize, 1)
-        if getattr(self.args, "Expose_Validation_Prob", False):
-            validation_feature = self.oracleValidationProbs
-        else:
-            validation_feature = np.zeros(self.oracleNum, dtype=float)
+    # ------------------------------------------------------------------
+    # Aggregate metrics used by main.py
+    # ------------------------------------------------------------------
+    def _slice(self, startP):
+        start = int(max(0, min(startP, self.requestNum - 1)))
+        return slice(start, self.requestNum)
 
-        wait_norm = np.clip(waitTimes / max(float(self.ddl), 1e-8), 0.0, 3.0) / 3.0
-        rep_norm = 0.5 * (np.tanh(reputations) + 1.0)
-        cost_norm = self.oracleCost / max(float(np.max(self.oracleCost)), 1e-8)
-        acc_norm = self.oracleAcc / max(float(np.max(self.oracleAcc)), 1e-8)
-        load_norm = np.clip(recent_load, 0.0, 2.0) / 2.0
-        X = np.vstack([
-            wait_norm,
-            rep_norm,
-            cost_norm,
-            acc_norm,
-            type_match,
-            validation_feature,
-            recent_success_rate,
-            load_norm,
-        ]).T.astype(float)
-        return np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
+    def _per_policy(self, fn):
+        return np.asarray([fn(name) for name in self.policy_names], dtype=float)
 
-    def _dynamic_oracle_adjacency(self, X):
-        """Construct a dynamic reliability graph over oracle nodes.
+    def get_totalRewards(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.sum(self.events[n][5, sl]))
 
-        Edges are stronger for same-service oracles, similar recent reliability,
-        similar load, and similar cost tier.  This graph is recomputed for each
-        policy/request from observable historical statistics, enabling the state
-        encoder to capture relations between oracle nodes rather than treating
-        each node independently.
-        """
-        N = self.oracleNum
-        types = self.oracleTypes.astype(int)
-        same_service = (types[:, None] == types[None, :]).astype(float)
-        rel = X[:, 6]
-        load = X[:, 7]
-        cost = X[:, 2]
-        rel_sim = np.exp(-2.5 * np.abs(rel[:, None] - rel[None, :]))
-        load_sim = np.exp(-2.0 * np.abs(load[:, None] - load[None, :]))
-        cost_sim = np.exp(-2.0 * np.abs(cost[:, None] - cost[None, :]))
-        A = (
-            float(getattr(self.args, "GNN_Service_Weight", 1.0)) * same_service
-            + float(getattr(self.args, "GNN_Reliability_Weight", 0.45)) * rel_sim
-            + float(getattr(self.args, "GNN_Load_Weight", 0.35)) * load_sim
-            + float(getattr(self.args, "GNN_Cost_Weight", 0.25)) * cost_sim
-        )
-        A += np.eye(N) * float(getattr(self.args, "GNN_Self_Weight", 0.55))
-        A = np.maximum(A, 0.0)
-        A = A / np.maximum(np.sum(A, axis=1, keepdims=True), 1e-8)
-        return A
+    def get_total_responseTs(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.mean(self.events[n][3, sl]))
 
-    def _graph_encode_oracle_features(self, request_attrs, policy_name):
-        """Lightweight dynamic GNN-style message passing encoder.
+    def get_totalSuccess(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.mean(self.events[n][7, sl]))
 
-        The operation is intentionally dependency-free NumPy message passing:
-        H^{l+1} = ReLU(w_self H^l + w_neigh A H^l).  The downstream RL network
-        learns on top of these graph-contextual embeddings.  This implements the
-        graph Oracle encoder without introducing PyTorch/TensorFlow dependencies.
-        """
-        H = self._build_oracle_feature_matrix(request_attrs, policy_name)
-        A = self._dynamic_oracle_adjacency(H)
-        steps = int(getattr(self.args, "GNN_Message_Steps", 2))
-        w_self = float(getattr(self.args, "GNN_Self_Weight", 0.55))
-        w_neigh = float(getattr(self.args, "GNN_Neighbor_Weight", 0.45))
-        for _ in range(max(0, steps)):
-            H = np.maximum(w_self * H + w_neigh * A.dot(H), 0.0)
-            # Keep scale bounded for the NumPy RL models.
-            H = np.clip(H, 0.0, 2.0)
-        return H
+    def get_totalSuccessInTime(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.mean((self.events[n][7, sl] > 0) & (self.events[n][3, sl] <= self.ddl)))
 
-    def getState(self, request_attrs, policy_name):
-        arrivalT = request_attrs[1]
-        length = request_attrs[2]
-        request_service = int(request_attrs[3])
-        idleTimes = self.get_oracle_idleT(policy_name)
-        reputations = self.get_oracle_reputation(policy_name)
-        waitTimes = np.maximum(idleTimes - arrivalT, 0)
+    def get_totalTimes(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.max(self.events[n][4, sl]))
 
-        if self.args.State_Mode == "original":
-            return np.hstack(([request_service], waitTimes, reputations))
+    def get_totalCost(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.mean(self.events[n][8, sl]))
 
-        type_match = np.array([1 if request_service == int(t) else 0 for t in self.oracleTypes])
-        req_num = self.reputation_factors[policy_name][0]
-        val_num = self.reputation_factors[policy_name][1]
-        recent_success_rate = np.divide(val_num, np.maximum(req_num, 1), dtype=float)
-        recent_load = req_num / max(self.timeperiodSize, 1)
-        # Do not expose true validation probability by default in hard scenarios;
-        # otherwise the task becomes too easy and resembles supervised role lookup.
-        if getattr(self.args, "Expose_Validation_Prob", False):
-            validation_feature = self.oracleValidationProbs
-        else:
-            validation_feature = np.zeros(self.oracleNum, dtype=float)
+    def get_totalMatchRate(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.mean(self.events[n][9, sl]))
 
-        if getattr(self.args, "Use_GNN_Encoder", False):
-            H = self._graph_encode_oracle_features(request_attrs, policy_name)
-            # Flatten by feature group to keep the original 3 + 8N layout.
-            oracle_block = H.T.reshape(-1)
-            return np.hstack(([request_service, length, self.ddl], oracle_block))
+    def _role_count(self, role_list, startP=0):
+        role_set = set(int(x) for x in role_list)
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: sum(int(a) in role_set for a in self.events[n][0, sl].astype(int)))
 
-        return np.hstack((
-            [request_service, length, self.ddl],
-            waitTimes,
-            reputations,
-            self.oracleCost,
-            self.oracleAcc,
-            type_match,
-            validation_feature,
-            recent_success_rate,
-            recent_load,
-        ))
+    def get_totalMaliciousNum(self, baseline_num=None, startP=0):
+        return self._role_count(self.malicious_oracles, startP)
 
-    def getStateP(self, request_id):
-        return self.events["BLOR"][3, request_id]
+    def get_totalNormalNum(self, baseline_num=None, startP=0):
+        return self._role_count(self.normal_oracles, startP)
 
-    def _metric_array(self, func):
-        values = np.zeros(self.policy_num)
-        for i, name in enumerate(self.policy_names):
-            values[i] = func(name)
-        return values
+    def get_totalTrustedNum(self, baseline_num=None, startP=0):
+        return self._role_count(self.trusted_oracles, startP)
 
-    def get_accumulateRewards(self, policies, start, end):
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][5, start:end])), 2)
+    def _pb_mean(self, row, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.mean(self.pb_records[n][row, sl]))
 
-    def get_accumulateCost(self, policies, start, end):
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][8, start:end])), 2)
+    def _pb_sum(self, row, startP=0):
+        sl = self._slice(startP)
+        return self._per_policy(lambda n: np.sum(self.pb_records[n][row, sl]))
 
-    def get_FinishTimes(self, policies, start, end):
-        return np.around(self._metric_array(lambda n: np.max(self.events[n][4, start:end]) if end > start else 0), 2)
+    def get_totalPrimarySuccessRate(self, baseline_num=None, startP=0): return self._pb_mean(0, startP)
+    def get_totalBackupUsedRate(self, baseline_num=None, startP=0): return self._pb_mean(1, startP)
+    def get_totalBackupRecoveryRate(self, baseline_num=None, startP=0): return self._pb_mean(3, startP)
+    def get_totalBackupSkippedRate(self, baseline_num=None, startP=0): return self._pb_mean(10, startP)
+    def get_totalBackupScoreMean(self, baseline_num=None, startP=0): return self._pb_mean(11, startP)
+    def get_totalPrimaryMaliciousNum(self, baseline_num=None, startP=0): return self._pb_sum(6, startP)
+    def get_totalBackupMaliciousNum(self, baseline_num=None, startP=0): return self._pb_sum(7, startP)
+    def get_totalPrimaryTrustedNum(self, baseline_num=None, startP=0): return self._pb_sum(8, startP)
+    def get_totalBackupTrustedNum(self, baseline_num=None, startP=0): return self._pb_sum(9, startP)
+    def get_totalHCRLSingleModeRate(self, baseline_num=None, startP=0): return self._pb_mean(13, startP)
+    def get_totalHCRLSerialModeRate(self, baseline_num=None, startP=0): return self._pb_mean(14, startP)
+    def get_totalHCRLParallelModeRate(self, baseline_num=None, startP=0): return self._pb_mean(15, startP)
+    def get_totalConstraintViolationRate(self, baseline_num=None, startP=0): return self._pb_mean(16, startP)
+    def get_totalCostViolation(self, baseline_num=None, startP=0): return self._pb_mean(17, startP)
+    def get_totalLatencyViolation(self, baseline_num=None, startP=0): return self._pb_mean(18, startP)
+    def get_totalRiskViolation(self, baseline_num=None, startP=0): return self._pb_mean(19, startP)
+    def get_totalHCRLLambdaCost(self, baseline_num=None, startP=0): return self._pb_mean(20, startP)
+    def get_totalHCRLLambdaLatency(self, baseline_num=None, startP=0): return self._pb_mean(21, startP)
+    def get_totalHCRLLambdaRisk(self, baseline_num=None, startP=0): return self._pb_mean(22, startP)
 
-    def get_executeTs(self, policies, start, end):
-        return np.around(self._metric_array(lambda n: np.mean(self.events[n][6, start:end]) if end > start else 0), 3)
+    def get_totalConditionalBackupRecoveryRate(self, baseline_num=None, startP=0):
+        sl = self._slice(startP)
+        out = []
+        for name in self.policy_names:
+            used = self.pb_records[name][1, sl]
+            rec = self.pb_records[name][3, sl]
+            out.append(float(np.sum(rec) / max(np.sum(used), 1.0)))
+        return np.asarray(out, dtype=float)
 
-    def get_waitTs(self, policies, start, end):
-        return np.around(self._metric_array(lambda n: np.mean(self.events[n][2, start:end]) if end > start else 0), 3)
+    def get_totalCostPerSuccess(self, baseline_num=None, startP=0):
+        cost = self.get_totalCost(baseline_num, startP)
+        succ = self.get_totalSuccess(baseline_num, startP)
+        return cost / np.maximum(succ, 1e-8)
 
-    def get_responseTs(self, policies, start, end):
-        return np.around(self._metric_array(lambda n: np.mean(self.events[n][3, start:end]) if end > start else 0), 3)
+    # Compatibility aliases for older main.py variants.
+    def get_accumulateRewards(self, baseline_num, startP, request_c): return self.get_totalRewards(baseline_num, startP)
+    def get_accumulateCost(self, baseline_num, startP, request_c): return self.get_totalCost(baseline_num, startP)
+    def get_FinishTimes(self, baseline_num, startP, request_c): return self.get_totalTimes(baseline_num, startP)
+    def get_executeTs(self, baseline_num, startP, request_c): return self.get_total_responseTs(baseline_num, startP)
+    def get_waitTs(self, baseline_num, startP, request_c): return self._per_policy(lambda n: np.mean(self.events[n][2, self._slice(startP)]))
+    def get_responseTs(self, baseline_num, startP, request_c): return self.get_total_responseTs(baseline_num, startP)
+    def get_successTimes(self, baseline_num, startP, request_c): return self.get_totalSuccess(baseline_num, startP)
+    def get_successInTime(self, baseline_num, startP, request_c): return self.get_totalSuccessInTime(baseline_num, startP)
 
-    def get_successTimes(self, policies, start, end):
-        denom = max(end - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][7, start:end]) / denom), 3)
-
-    def get_successInTime(self, policies, start, end):
-        denom = max(end - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][9, start:end]) / denom), 3)
-
-    def get_rejectTimes(self, policies, start, end):
-        return self.get_accumulateCost(policies, start, end)
-
-    def get_totalRewards(self, policies, start):
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][5, start:self.requestNum])), 3)
-
-    def _assigned_count_from_events(self, policy_name, oracle_indices, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        chosen = self.events[policy_name][0, start:self.requestNum].astype(int)
-        return float(np.sum(np.isin(chosen, oracle_indices)))
-
-    def get_totalMaliciousNum(self, policies, start=0):
-        idx = self.malicious_oracles
-        return np.around(self._metric_array(lambda n: self._assigned_count_from_events(n, idx, start)), 1)
-
-    def get_totalNormalNum(self, policies, start=0):
-        idx = self.normal_oracles
-        return np.around(self._metric_array(lambda n: self._assigned_count_from_events(n, idx, start)), 1)
-
-    def get_totalTrustedNum(self, policies, start=0):
-        idx = self.trusted_oracles
-        return np.around(self._metric_array(lambda n: self._assigned_count_from_events(n, idx, start)), 1)
-
-    def _pb_rate(self, row, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][row, start:self.requestNum]) / denom), 3)
-
-    def _pb_count(self, row, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][row, start:self.requestNum])), 1)
-
-    def get_totalPrimarySuccessRate(self, policies, start=0):
-        return self._pb_rate(0, start)
-
-    def get_totalBackupUsedRate(self, policies, start=0):
-        return self._pb_rate(1, start)
-
-    def get_totalBackupRecoveryRate(self, policies, start=0):
-        return self._pb_rate(3, start)
-
-    def get_totalBackupSkippedRate(self, policies, start=0):
-        return self._pb_rate(10, start)
-
-    def get_totalConditionalBackupRecoveryRate(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        def _cond(policy_name):
-            used = np.sum(self.pb_records[policy_name][1, start:self.requestNum])
-            rec = np.sum(self.pb_records[policy_name][3, start:self.requestNum])
-            return float(rec / max(used, 1.0))
-        return np.around(self._metric_array(_cond), 3)
-
-    def get_totalBackupScoreMean(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        def _score(policy_name):
-            scores = self.pb_records[policy_name][11, start:self.requestNum]
-            mask = scores != 0
-            return float(np.mean(scores[mask])) if np.any(mask) else 0.0
-        return np.around(self._metric_array(_score), 3)
-
-    def get_totalPrimaryMaliciousNum(self, policies, start=0):
-        return self._pb_count(6, start)
-
-    def get_totalBackupMaliciousNum(self, policies, start=0):
-        return self._pb_count(7, start)
-
-    def get_totalPrimaryTrustedNum(self, policies, start=0):
-        return self._pb_count(8, start)
-
-    def get_totalBackupTrustedNum(self, policies, start=0):
-        return self._pb_count(9, start)
-
-    def get_totalHCRLSingleModeRate(self, policies, start=0):
-        return self._pb_rate(13, start)
-
-    def get_totalHCRLSerialModeRate(self, policies, start=0):
-        return self._pb_rate(14, start)
-
-    def get_totalHCRLParallelModeRate(self, policies, start=0):
-        return self._pb_rate(15, start)
-
-    def get_totalConstraintViolationRate(self, policies, start=0):
-        return self._pb_rate(16, start)
-
-    def get_totalCostViolationMean(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][17, start:self.requestNum]) / denom), 4)
-
-    def get_totalLatencyViolationMean(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][18, start:self.requestNum]) / denom), 4)
-
-    def get_totalRiskViolationMean(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.pb_records[n][19, start:self.requestNum]) / denom), 4)
-
-
-    def get_totalHCRLLambdaCostMean(self, policies, start=0):
-        return self._pb_rate(20, start)
-
-    def get_totalHCRLLambdaLatencyMean(self, policies, start=0):
-        return self._pb_rate(21, start)
-
-    def get_totalHCRLLambdaRiskMean(self, policies, start=0):
-        return self._pb_rate(22, start)
-
-    def get_totalCostPerSuccess(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        def _cps(policy_name):
-            total_cost = float(np.sum(self.events[policy_name][8, start:self.requestNum]))
-            total_success = float(np.sum(self.events[policy_name][7, start:self.requestNum]))
-            return total_cost / max(total_success, 1.0)
-        return np.around(self._metric_array(_cps), 5)
-
-    def get_totalMatchRate(self, policies, start=0):
-        start = min(max(int(start), 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-
-        def _match_rate(policy_name):
-            chosen = self.events[policy_name][0, start:self.requestNum].astype(int)
-            chosen_types = self.oracleTypes[chosen]
-            request_types = self.request_type[start:self.requestNum]
-            return float(np.sum(chosen_types == request_types) / denom)
-
-        return np.around(self._metric_array(_match_rate), 3)
-
-    def get_totalTimes(self, policies, start):
-        start_idx = min(max(start, 0), self.requestNum - 1)
-        return np.around(self._metric_array(lambda n: np.max(self.events[n][4, :]) - self.arrival_Times[start_idx]), 3)
-
-    def get_all_responseTs(self, policies):
-        respTs = np.zeros((self.policy_num, self.requestNum))
-        for i, name in enumerate(self.policy_names):
-            respTs[i, :] = self.events[name][3, :]
-        return np.around(respTs, 3)
-
-    def get_total_responseTs(self, policies, start):
-        start = min(max(start, 0), self.requestNum - 1)
-        return np.around(self._metric_array(lambda n: np.mean(self.events[n][3, start:self.requestNum])), 3)
-
-    def get_totalSuccess(self, policies, start):
-        start = min(max(start, 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][7, start:self.requestNum]) / denom), 3)
-
-    def get_totalSuccessInTime(self, policies, start):
-        start = min(max(start, 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][9, start:self.requestNum]) / denom), 3)
-
-    def get_totalCost(self, policies, start):
-        start = min(max(start, 0), self.requestNum - 1)
-        denom = max(self.requestNum - start, 1)
-        return np.around(self._metric_array(lambda n: np.sum(self.events[n][8, start:self.requestNum]) / denom), 5)
+    # Extra naming variants to tolerate small differences in main.py versions.
+    def get_totalHCRLSingleMode(self, baseline_num=None, startP=0): return self.get_totalHCRLSingleModeRate(baseline_num, startP)
+    def get_totalHCRLSerialMode(self, baseline_num=None, startP=0): return self.get_totalHCRLSerialModeRate(baseline_num, startP)
+    def get_totalHCRLParallelMode(self, baseline_num=None, startP=0): return self.get_totalHCRLParallelModeRate(baseline_num, startP)
+    def get_totalCostViolationRate(self, baseline_num=None, startP=0): return self.get_totalCostViolation(baseline_num, startP)
+    def get_totalLatencyViolationRate(self, baseline_num=None, startP=0): return self.get_totalLatencyViolation(baseline_num, startP)
+    def get_totalRiskViolationRate(self, baseline_num=None, startP=0): return self.get_totalRiskViolation(baseline_num, startP)
