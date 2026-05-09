@@ -626,24 +626,34 @@ for episode in range(args.Epoch):
     print(f'total performance (after {startP} requests):')
     for i, name in enumerate(args.Baselines):
         print(
-            f"[{name}] reward:", total_Rewards[i],
-            ' avg_responseT:', avg_allRespTs[i],
-            'success_rate:', total_success[i],
-            'success_time_rate:', total_success_time[i],
-            ' finishT:', total_Ts[i],
-            'Cost:', total_cost[i],
+            f"[{name}] "
+            f"reward: {total_Rewards[i]:.2f} "
+            f"avg_responseT: {avg_allRespTs[i]:.3f} "
+            f"success_rate: {total_success[i] * 100:.2f}% "
+            f"success_time_rate: {total_success_time[i] * 100:.2f}% "
+            f"finishT: {total_Ts[i]:.2f} "
+            f"Cost: {total_cost[i]:.3f}"
         )
+
     for diag_name in ["PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle"]:
         if diag_name in args.Baselines:
             idx_diag = args.Baselines.index(diag_name)
+
+            primary_success = env.get_totalPrimarySuccessRate(args.Baseline_num, startP)[idx_diag]
+            backup_used = env.get_totalBackupUsedRate(args.Baseline_num, startP)[idx_diag]
+            backup_recovery = env.get_totalBackupRecoveryRate(args.Baseline_num, startP)[idx_diag]
+            conditional_recovery = env.get_totalConditionalBackupRecoveryRate(args.Baseline_num, startP)[idx_diag]
+            backup_skipped = env.get_totalBackupSkippedRate(args.Baseline_num, startP)[idx_diag]
+            backup_score = env.get_totalBackupScoreMean(args.Baseline_num, startP)[idx_diag]
+
             print(
-                f'[{diag_name} diagnostics]',
-                'primary_success_rate:', env.get_totalPrimarySuccessRate(args.Baseline_num, startP)[idx_diag],
-                'backup_used_rate:', env.get_totalBackupUsedRate(args.Baseline_num, startP)[idx_diag],
-                'backup_recovery_rate:', env.get_totalBackupRecoveryRate(args.Baseline_num, startP)[idx_diag],
-                'conditional_backup_recovery_rate:', env.get_totalConditionalBackupRecoveryRate(args.Baseline_num, startP)[idx_diag],
-                'backup_skipped_rate:', env.get_totalBackupSkippedRate(args.Baseline_num, startP)[idx_diag],
-                'backup_score_mean:', env.get_totalBackupScoreMean(args.Baseline_num, startP)[idx_diag],
+                f"[{diag_name} diagnostics] "
+                f"primary_success_rate: {primary_success * 100:.2f}% "
+                f"backup_used_rate: {backup_used * 100:.2f}% "
+                f"backup_recovery_rate: {backup_recovery * 100:.2f}% "
+                f"conditional_backup_recovery_rate: {conditional_recovery * 100:.2f}% "
+                f"backup_skipped_rate: {backup_skipped * 100:.2f}% "
+                f"backup_score_mean: {backup_score:.3f}"
             )
 
     if episode != 0 or args.Epoch == 1:
