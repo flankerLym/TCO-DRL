@@ -214,6 +214,52 @@ class baseline_DQN:
         np.savez_compressed(path, **payload)
         return path
 
+    def load_model(self, path, strict=False, load_epsilon=True):
+        """Load a lightweight .npz checkpoint saved by save_model.
+
+        strict=False lets related heads be reused across DQN/dueling variants:
+        a plain DQN head can initialize a dueling actor advantage head, and a
+        dueling advantage head can initialize a plain DQN head.
+        """
+        data = np.load(path, allow_pickle=True)
+        n_actions = int(data["n_actions"]) if "n_actions" in data else self.n_actions
+        n_features = int(data["n_features"]) if "n_features" in data else self.n_features
+        if n_actions != self.n_actions or n_features != self.n_features:
+            msg = (f"checkpoint shape mismatch for {self.scope}: "
+                   f"ckpt=({n_features},{n_actions}) model=({self.n_features},{self.n_actions})")
+            if strict:
+                raise ValueError(msg)
+            print(f"[Weight load warning] {msg}; skipped {path}")
+            return False
+        self.W1 = np.asarray(data["W1"], dtype=np.float32).copy()
+        self.b1 = np.asarray(data["b1"], dtype=np.float32).copy()
+        if self.dueling:
+            if all(k in data for k in ["Wv", "bv", "Wa", "ba"]):
+                self.Wv = np.asarray(data["Wv"], dtype=np.float32).copy()
+                self.bv = np.asarray(data["bv"], dtype=np.float32).copy()
+                self.Wa = np.asarray(data["Wa"], dtype=np.float32).copy()
+                self.ba = np.asarray(data["ba"], dtype=np.float32).copy()
+            elif all(k in data for k in ["W2", "b2"]):
+                self.Wv = np.zeros_like(self.Wv, dtype=np.float32)
+                self.bv = np.zeros_like(self.bv, dtype=np.float32)
+                self.Wa = np.asarray(data["W2"], dtype=np.float32).copy()
+                self.ba = np.asarray(data["b2"], dtype=np.float32).copy()
+            else:
+                raise ValueError(f"Unsupported DQN checkpoint format: {path}")
+        else:
+            if all(k in data for k in ["W2", "b2"]):
+                self.W2 = np.asarray(data["W2"], dtype=np.float32).copy()
+                self.b2 = np.asarray(data["b2"], dtype=np.float32).copy()
+            elif all(k in data for k in ["Wa", "ba"]):
+                self.W2 = np.asarray(data["Wa"], dtype=np.float32).copy()
+                self.b2 = np.asarray(data["ba"], dtype=np.float32).copy()
+            else:
+                raise ValueError(f"Unsupported DQN checkpoint format: {path}")
+        if load_epsilon and "epsilon" in data:
+            self.set_epsilon(float(np.asarray(data["epsilon"]).item()))
+        self._copy_eval_to_target()
+        return True
+
 
 class DuelingDoubleDQN(baseline_DQN):
     def __init__(self, n_actions, n_features, hidden_units=64, scope="RA_DDQN", learning_rate=0.002, **kwargs):
@@ -342,6 +388,39 @@ class OptionActorCritic:
                             Wp=self.Wp, bp=self.bp, Wv=self.Wv, bv=self.bv,
                             reward_list=np.asarray(self.reward_list, dtype=np.float32), metadata=np.array(str(metadata or {})))
         return path
+
+    def load_model(self, path, strict=False, load_epsilon=True):
+        """Load a lightweight .npz checkpoint saved by OptionActorCritic or a compatible DQN head."""
+        data = np.load(path, allow_pickle=True)
+        n_actions = int(data["n_actions"]) if "n_actions" in data else self.n_actions
+        n_features = int(data["n_features"]) if "n_features" in data else self.n_features
+        if n_actions != self.n_actions or n_features != self.n_features:
+            msg = (f"checkpoint shape mismatch for {self.scope}: "
+                   f"ckpt=({n_features},{n_actions}) model=({self.n_features},{self.n_actions})")
+            if strict:
+                raise ValueError(msg)
+            print(f"[Weight load warning] {msg}; skipped {path}")
+            return False
+        self.W1 = np.asarray(data["W1"], dtype=np.float32).copy()
+        self.b1 = np.asarray(data["b1"], dtype=np.float32).copy()
+        if all(k in data for k in ["Wp", "bp", "Wv", "bv"]):
+            self.Wp = np.asarray(data["Wp"], dtype=np.float32).copy()
+            self.bp = np.asarray(data["bp"], dtype=np.float32).copy()
+            self.Wv = np.asarray(data["Wv"], dtype=np.float32).copy()
+            self.bv = np.asarray(data["bv"], dtype=np.float32).copy()
+        elif all(k in data for k in ["W2", "b2"]):
+            self.Wp = np.asarray(data["W2"], dtype=np.float32).copy()
+            self.bp = np.asarray(data["b2"], dtype=np.float32).copy()
+            self.Wv = np.zeros_like(self.Wv, dtype=np.float32)
+            self.bv = np.zeros_like(self.bv, dtype=np.float32)
+        elif all(k in data for k in ["Wa", "ba"]):
+            self.Wp = np.asarray(data["Wa"], dtype=np.float32).copy()
+            self.bp = np.asarray(data["ba"], dtype=np.float32).copy()
+            self.Wv = np.zeros_like(self.Wv, dtype=np.float32)
+            self.bv = np.zeros_like(self.bv, dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported OptionActorCritic checkpoint format: {path}")
+        return True
 
 
 class baseline_PPO(OptionActorCritic):

@@ -124,7 +124,113 @@ def build_models(env, args):
     return brain
 
 
+def _canonical_weight_key(name):
+    key = str(name).strip().strip('"').strip("'")
+    aliases = {
+        "dqn": "DQN", "tco-drl": "DQN", "tco_drl": "DQN",
+        "ppo": "PPO",
+        "ra": "RA-DDQN", "ra-ddqn": "RA-DDQN", "ra_ddqn": "RA-DDQN", "raddqn": "RA-DDQN",
+        "pb": "PB-SafeDQN", "pb-safedqn": "PB-SafeDQN", "pb_safedqn": "PB-SafeDQN",
+        "cobra": "COBRA-Oracle", "cobra-oracle": "COBRA-Oracle", "cobra_oracle": "COBRA-Oracle",
+        "hcrl": "HCRL-Oracle", "hcrl-oracle": "HCRL-Oracle", "hcrl_oracle": "HCRL-Oracle",
+        "hcrl-mode": "HCRL_Mode", "hcrl_mode": "HCRL_Mode", "hcrlmode": "HCRL_Mode",
+        "hcrl-primary": "HCRL_Primary", "hcrl_primary": "HCRL_Primary", "hcrlprimary": "HCRL_Primary",
+        "hcrl-backup": "HCRL_Backup", "hcrl_backup": "HCRL_Backup", "hcrlbackup": "HCRL_Backup",
+    }
+    if key in ["DQN", "PPO", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle", "HCRL_Mode", "HCRL_Primary", "HCRL_Backup"]:
+        return key
+    return aliases.get(key.lower(), key)
+
+
+def _parse_weight_specs(args):
+    specs = {}
+    for item in list(getattr(args, "Load_Weights", []) or []):
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid --Load_Weights item: {item}. Expected METHOD=path")
+        k, v = item.split("=", 1)
+        specs[_canonical_weight_key(k)] = v.strip().strip('"').strip("'")
+    shortcut = str(getattr(args, "Weight_Path", "") or "").strip()
+    if shortcut:
+        selected_rl = [m for m in getattr(args, "Baselines", []) if m in ["DQN", "PPO", "RA-DDQN", "PB-SafeDQN", "COBRA-Oracle", "HCRL-Oracle"]]
+        if len(selected_rl) == 1:
+            specs[selected_rl[0]] = shortcut
+        else:
+            raise ValueError("--Weight_Path shortcut requires exactly one selected RL method. Use --Load_Weights METHOD=path instead.")
+    return specs
+
+
+def _candidate_checkpoint_files(path, names):
+    p = Path(path).expanduser()
+    if p.is_file():
+        return [p]
+    if not p.exists():
+        return []
+    out = []
+    for name in names:
+        c = p / name
+        if c.exists():
+            out.append(c)
+    return out
+
+
+def _load_one_model(model, path, name, args):
+    if model is None or not hasattr(model, "load_model"):
+        print(f"[Weight load warning] {name} has no load_model(); skipped {path}")
+        return False
+    ok = model.load_model(str(path), strict=bool(getattr(args, "Strict_Weight_Load", False)))
+    if ok:
+        print(f"[Weight load] loaded {name} <- {path}")
+    return bool(ok)
+
+
+def load_requested_weights(brain, args):
+    specs = _parse_weight_specs(args)
+    loaded = {}
+    if not specs:
+        return loaded
+    for method, path in specs.items():
+        if method == "HCRL-Oracle":
+            # A HCRL run folder contains three separate checkpoints.
+            mapping = {
+                "HCRL_Mode": ["HCRL_Mode.npz", "HCRL_Mode_OptionAC.npz", "HCRL-Mode.npz"],
+                "HCRL_Primary": ["HCRL_Primary.npz", "HCRL_Primary_OptionAC.npz", "HCRL-Primary.npz"],
+                "HCRL_Backup": ["HCRL_Backup.npz", "HCRL_Backup_OptionAC.npz", "HCRL-Backup.npz"],
+            }
+            p = Path(path).expanduser()
+            if p.is_file():
+                print(f"[Weight load warning] HCRL-Oracle expects a run directory. File path {p} will be loaded as HCRL_Primary only.")
+                loaded["HCRL_Primary"] = _load_one_model(brain.get("HCRL_Primary"), p, "HCRL_Primary", args)
+            else:
+                for key, names in mapping.items():
+                    candidates = _candidate_checkpoint_files(p, names)
+                    if candidates:
+                        loaded[key] = _load_one_model(brain.get(key), candidates[0], key, args)
+                    else:
+                        print(f"[Weight load warning] missing {key} checkpoint under {p}; looked for {names}")
+            continue
+        model_key = method
+        candidates = _candidate_checkpoint_files(path, [f"{method}.npz", f"{method.replace('-', '_')}.npz"])
+        if not candidates:
+            print(f"[Weight load warning] checkpoint not found for {method}: {path}")
+            continue
+        loaded[method] = _load_one_model(brain.get(model_key), candidates[0], method, args)
+    if getattr(args, "Eval_Only", False):
+        for model in brain.values():
+            if hasattr(model, "set_epsilon"):
+                # This affects stochastic choose_action, but eval code also uses choose_best_action.
+                model.set_epsilon(1.0)
+    return loaded
+
+
+def _choose_value_policy(model, state, mask, args):
+    return model.choose_best_action(state, mask) if getattr(args, "Greedy_Eval", False) and hasattr(model, "choose_best_action") else model.choose_action(state, mask)
+
+
 def maybe_warm_start(brain, args, episode, flags):
+    if getattr(args, "Eval_Only", False):
+        return
     if "COBRA-Oracle" in args.Baselines and not flags.get("cobra", False) and not args.COBRA_No_Teacher and episode >= args.COBRA_WarmStart_Episode:
         teacher = brain.get(args.COBRA_Teacher_Source)
         if teacher is not None and brain["COBRA-Oracle"].copy_from(teacher, copy_optimizer_state=False):
@@ -223,6 +329,9 @@ def collect_final_results(env, args, startP):
 # Main experiment.
 env = SchedulingEnv(args)
 brain = build_models(env, args)
+loaded_weights = load_requested_weights(brain, args)
+if loaded_weights:
+    print(f"[Weight load summary] {loaded_weights}")
 flags = {"cobra": False, "hcrl": False}
 eval_start = min(2000, max(0, args.Request_Num // 2))
 last_results = None
@@ -264,13 +373,14 @@ for episode in range(args.Epoch):
 
         if "DQN" in brain:
             s = env.getState(request_attrs, "DQN")
-            if "DQN" in last:
+            if not args.Eval_Only and "DQN" in last:
                 brain["DQN"].store_transition(last["DQN"][0], last["DQN"][1], last["DQN"][2], s, mask)
-            a = brain["DQN"].choose_action(s, mask)
+            a = _choose_value_policy(brain["DQN"], s, mask, args)
             r = env.feedback(request_attrs, a, "DQN")
-            if global_step > args.Dqn_start_learn and global_step % args.Dqn_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.Dqn_start_learn and global_step % args.Dqn_learn_interval == 0:
                 brain["DQN"].learn()
-            last["DQN"] = (s, a, r, mask)
+            if not args.Eval_Only:
+                last["DQN"] = (s, a, r, mask)
 
         if "BLOR" in args.Baselines:
             start_counter = (blor_c - 1) * 200
@@ -300,38 +410,44 @@ for episode in range(args.Epoch):
 
         if "PPO" in brain:
             s = env.getState(request_attrs, "PPO")
-            a, prob = brain["PPO"].choose_action(s, mask)
+            if args.Greedy_Eval:
+                a = brain["PPO"].choose_best_action(s, mask); prob = 1.0
+            else:
+                a, prob = brain["PPO"].choose_action(s, mask)
             r = env.feedback(request_attrs, a, "PPO")
-            brain["PPO"].store_transition(s, a, r, prob, mask)
-            if global_step > args.PPO_start_learn and global_step % args.PPO_learn_interval == 0:
-                brain["PPO"].learn()
+            if not args.Eval_Only:
+                brain["PPO"].store_transition(s, a, r, prob, mask)
+                if global_step > args.PPO_start_learn and global_step % args.PPO_learn_interval == 0:
+                    brain["PPO"].learn()
 
         if "RA-DDQN" in brain:
             s = env.getState(request_attrs, "RA-DDQN")
-            if "RA-DDQN" in last:
+            if not args.Eval_Only and "RA-DDQN" in last:
                 brain["RA-DDQN"].store_transition(last["RA-DDQN"][0], last["RA-DDQN"][1], last["RA-DDQN"][2], s, mask)
-            a = brain["RA-DDQN"].choose_action(s, mask)
+            a = _choose_value_policy(brain["RA-DDQN"], s, mask, args)
             r = env.feedback(request_attrs, a, "RA-DDQN")
-            if global_step > args.RA_start_learn and global_step % args.RA_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.RA_start_learn and global_step % args.RA_learn_interval == 0:
                 brain["RA-DDQN"].learn()
-            last["RA-DDQN"] = (s, a, r, mask)
+            if not args.Eval_Only:
+                last["RA-DDQN"] = (s, a, r, mask)
 
         if "PB-SafeDQN" in brain:
             s = env.getState(request_attrs, "PB-SafeDQN")
-            if "PB-SafeDQN" in last:
+            if not args.Eval_Only and "PB-SafeDQN" in last:
                 brain["PB-SafeDQN"].store_transition(last["PB-SafeDQN"][0], last["PB-SafeDQN"][1], last["PB-SafeDQN"][2], s, mask)
-            a = brain["PB-SafeDQN"].choose_action(s, mask)
+            a = _choose_value_policy(brain["PB-SafeDQN"], s, mask, args)
             r = env.feedback_primary_backup(request_attrs, a, "PB-SafeDQN")
-            if global_step > args.PB_start_learn and global_step % args.PB_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.PB_start_learn and global_step % args.PB_learn_interval == 0:
                 brain["PB-SafeDQN"].learn()
-            last["PB-SafeDQN"] = (s, a, r, mask)
+            if not args.Eval_Only:
+                last["PB-SafeDQN"] = (s, a, r, mask)
 
         if "COBRA-Oracle" in brain:
             s = env.getState(request_attrs, "COBRA-Oracle")
-            if "COBRA-Oracle" in last:
+            if not args.Eval_Only and "COBRA-Oracle" in last:
                 brain["COBRA-Oracle"].store_transition(last["COBRA-Oracle"][0], last["COBRA-Oracle"][1], last["COBRA-Oracle"][2], s, mask)
             teacher_action = None
-            if not args.COBRA_No_Teacher and episode < args.COBRA_Teacher_Guidance_Episodes:
+            if not args.Eval_Only and not args.COBRA_No_Teacher and episode < args.COBRA_Teacher_Guidance_Episodes:
                 teacher = brain.get(args.COBRA_Teacher_Source)
                 if teacher is not None:
                     teacher_action = teacher.choose_best_action(s, mask)
@@ -339,18 +455,19 @@ for episode in range(args.Epoch):
             if teacher_action is not None:
                 frac = max(0.0, 1.0 - episode / max(args.COBRA_Teacher_Guidance_Episodes, 1))
                 teacher_prob = max(args.COBRA_Min_Teacher_Prob, args.COBRA_Teacher_Start_Prob * frac)
-            a = int(teacher_action) if teacher_action is not None and np.random.rand() < teacher_prob else brain["COBRA-Oracle"].choose_action(s, mask)
+            a = int(teacher_action) if teacher_action is not None and np.random.rand() < teacher_prob else _choose_value_policy(brain["COBRA-Oracle"], s, mask, args)
             r = env.feedback_primary_backup(request_attrs, a, "COBRA-Oracle")
-            if global_step > args.COBRA_start_learn and global_step % args.COBRA_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.COBRA_start_learn and global_step % args.COBRA_learn_interval == 0:
                 brain["COBRA-Oracle"].learn()
-            last["COBRA-Oracle"] = (s, a, r, mask)
+            if not args.Eval_Only:
+                last["COBRA-Oracle"] = (s, a, r, mask)
 
         if "HCRL-Oracle" in args.Baselines:
             s_primary = env.getState(request_attrs, "HCRL-Oracle")
             primary_mask = env.get_action_mask(request_attrs)
             # Primary selection, teacher-guided early.
             teacher_action = None
-            if not args.HCRL_No_Teacher and episode < args.HCRL_Teacher_Guidance_Episodes:
+            if not args.Eval_Only and not args.HCRL_No_Teacher and episode < args.HCRL_Teacher_Guidance_Episodes:
                 teacher = brain.get(args.HCRL_Teacher_Source)
                 if teacher is not None:
                     teacher_action = teacher.choose_best_action(s_primary, primary_mask)
@@ -358,7 +475,7 @@ for episode in range(args.Epoch):
             if teacher_action is not None:
                 frac = max(0.0, 1.0 - episode / max(args.HCRL_Teacher_Guidance_Episodes, 1))
                 teacher_prob = max(args.HCRL_Min_Teacher_Prob, args.HCRL_Teacher_Start_Prob * frac)
-            primary_action = int(teacher_action) if teacher_action is not None and np.random.rand() < teacher_prob else brain["HCRL_Primary"].choose_action(s_primary, primary_mask)
+            primary_action = int(teacher_action) if teacher_action is not None and np.random.rand() < teacher_prob else _choose_value_policy(brain["HCRL_Primary"], s_primary, primary_mask, args)
 
             s_mode = env.get_hcrl_mode_state(request_attrs, "HCRL-Oracle")
             mode_mask = env.get_hcrl_mode_mask(request_attrs, "HCRL-Oracle", primary_action)
@@ -367,7 +484,7 @@ for episode in range(args.Epoch):
             elif getattr(args, "HCRL_Fixed_Parallel_Mode", False):
                 mode_action = args.HCRL_Mode_Names.index("parallel_safe") if "parallel_safe" in args.HCRL_Mode_Names else len(args.HCRL_Mode_Names) - 1
             else:
-                mode_action = brain["HCRL_Mode"].choose_action(s_mode, mode_mask)
+                mode_action = _choose_value_policy(brain["HCRL_Mode"], s_mode, mode_mask, args)
 
             backup_mask = env.get_backup_action_mask(request_attrs, primary_action)
             mode_name = args.HCRL_Mode_Names[int(mode_action)]
@@ -381,30 +498,31 @@ for episode in range(args.Epoch):
                 if episode < args.HCRL_Backup_Guidance_Episodes:
                     frac_b = max(0.0, 1.0 - episode / max(args.HCRL_Backup_Guidance_Episodes, 1))
                     backup_teacher_prob = max(args.HCRL_Backup_Min_Prob, args.HCRL_Backup_Start_Prob * frac_b)
-                if np.random.rand() < backup_teacher_prob:
+                if (not args.Eval_Only) and np.random.rand() < backup_teacher_prob:
                     backup_action = env.choose_backup_oracle(request_attrs, primary_action, "HCRL-Oracle")
                 else:
-                    backup_action = brain["HCRL_Backup"].choose_action(s_primary, backup_mask)
+                    backup_action = _choose_value_policy(brain["HCRL_Backup"], s_primary, backup_mask, args)
 
             # Store previous transitions with current states.
-            if "HCRL_Mode" in last:
+            if not args.Eval_Only and "HCRL_Mode" in last:
                 brain["HCRL_Mode"].store_transition(last["HCRL_Mode"][0], last["HCRL_Mode"][1], last["HCRL_Mode"][2], s_mode, mode_mask, last["HCRL_Mode"][3])
-            if "HCRL_Primary" in last:
+            if not args.Eval_Only and "HCRL_Primary" in last:
                 brain["HCRL_Primary"].store_transition(last["HCRL_Primary"][0], last["HCRL_Primary"][1], last["HCRL_Primary"][2], s_primary, primary_mask, last["HCRL_Primary"][3])
-            if "HCRL_Backup" in last:
+            if not args.Eval_Only and "HCRL_Backup" in last:
                 brain["HCRL_Backup"].store_transition(last["HCRL_Backup"][0], last["HCRL_Backup"][1], last["HCRL_Backup"][2], s_primary, backup_mask, last["HCRL_Backup"][3])
 
             feedback = env.feedback_hcrl(request_attrs, mode_action, primary_action, backup_action, "HCRL-Oracle")
-            if global_step > args.HCRL_start_learn and global_step % args.HCRL_Mode_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.HCRL_start_learn and global_step % args.HCRL_Mode_learn_interval == 0:
                 brain["HCRL_Mode"].learn()
-            if global_step > args.HCRL_start_learn and global_step % args.HCRL_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.HCRL_start_learn and global_step % args.HCRL_learn_interval == 0:
                 brain["HCRL_Primary"].learn()
-            if global_step > args.HCRL_start_learn and global_step % args.HCRL_Backup_learn_interval == 0:
+            if not args.Eval_Only and global_step > args.HCRL_start_learn and global_step % args.HCRL_Backup_learn_interval == 0:
                 brain["HCRL_Backup"].learn()
-            last["HCRL_Mode"] = (s_mode, mode_action, feedback["mode_reward"], mode_mask)
-            last["HCRL_Primary"] = (s_primary, primary_action, feedback["primary_reward"], primary_mask)
-            if mode_name not in ["single_cost", "single_safe"] and backup_action >= 0:
-                last["HCRL_Backup"] = (s_primary, backup_action, feedback["backup_reward"], backup_mask)
+            if not args.Eval_Only:
+                last["HCRL_Mode"] = (s_mode, mode_action, feedback["mode_reward"], mode_mask)
+                last["HCRL_Primary"] = (s_primary, primary_action, feedback["primary_reward"], primary_mask)
+                if mode_name not in ["single_cost", "single_safe"] and backup_action >= 0:
+                    last["HCRL_Backup"] = (s_primary, backup_action, feedback["backup_reward"], backup_mask)
 
         if request_c % 500 == 0:
             env.get_accumulateRewards(args.Baseline_num, performance_c, request_c)
